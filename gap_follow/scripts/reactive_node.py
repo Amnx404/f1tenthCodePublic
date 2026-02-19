@@ -24,14 +24,16 @@ class ReactiveFollowGap(Node):
         self.pub_drive = self.create_publisher(AckermannDriveStamped, drive_topic, 10)
         
         # Parameters (Tune ❤️❤️❤️)
-        self.bubble_radius = 0.68  # Radius of safety bubble in meters 
+        self.bubble_radius = 0.7  # Radius of safety bubble in meters    0.7 (critical for L shape trap)
         self.preprocess_conv_size = 3 # Moving average window
-        self.max_lidar_dist = 3.0    # Max reliable distance to consider
-        self.max_speed = 5.0        # Max speed on straights  
-        self.min_speed = 2.0        # Min speed in sharp corners
-        self.fov_angle = np.radians(130) # Only use front 130 degrees
+        self.max_lidar_dist = 3.5   # Max reliable distance to consider 3.5 
+        self.max_speed = 3.0        # Max speed on straights  
+        self.min_speed = 0.5        # Min speed in sharp corners
+        self.fov_angle = np.radians(160) # Only use front 130 degrees
         self.prev_steering_angle = 0.0
-        self.alpha = 0.2  # Smoothing factor (0.0 to 1.0). Lower = smoother but more lag.
+        self.alpha = 0.2            # Smoothing factor (0.0 to 1.0). Lower = smoother but more lag.
+        self.car_width = 0.35        # The width to extend the obstacle (0.5m ~ half car width)
+        self.disparity_threshold = 0.3  # Minimum jump in distance to consider it a disparity 
 
     def preprocess_lidar(self, ranges):
         """ Preprocess the LiDAR scan array. Expert implementation includes:
@@ -50,15 +52,14 @@ class ReactiveFollowGap(Node):
         # 2. Smooth data using a averaging each point with its neighbors. This prevents a single "glitchy" zero-reading from mistaken
         proc_ranges = np.convolve(proc_ranges, np.ones(self.preprocess_conv_size), 'same') / self.preprocess_conv_size
 
-        
-        
         return proc_ranges
 
     def find_max_gap(self, free_space_ranges):
         """ Return the start index & end index of the max gap in free_space_ranges
         """
         # 1. Create a boolean mask: True where distance is non-zero , False where obstacles (0.0) are.
-        mask = free_space_ranges > 0.0
+        # Treat very small values as 0 to filter out noise
+        mask = free_space_ranges > 0.1  
         
         # 2. Convert mask to int (0/1) and take difference between neighbors.
         #    1->0 becomes -1 (gap ended). 0->1 becomes 1 (gap started).
@@ -79,16 +80,33 @@ class ReactiveFollowGap(Node):
         if mask[-1]:
             run_ends = np.append(run_ends, len(free_space_ranges))
             
-        # 7. Safety check: If no gaps found, return the full range (panic).
+        # 7. SAFETY FALLBACK: If the disparity extender closes ALL gaps
         if len(run_starts) == 0:
-            return 0, len(free_space_ranges) - 1
+            # Panic mode: Find the single furthest point available and try to squeeze toward it
+            best_idx = np.argmax(free_space_ranges)
+            return best_idx, best_idx + 1
 
-        # Calculate length of each gap
-        lengths = run_ends - run_starts
-        # Pick the longest gap
-        longest_gap_idx = np.argmax(lengths)
+        gap_max_depths = []
+        gap_widths = []
+
+        # 8. Analyze every valid gap
+        for s, e in zip(run_starts, run_ends):
+            gap_max_depths.append(np.max(free_space_ranges[s:e]))
+            gap_widths.append(e - s)
+            
+        gap_max_depths = np.array(gap_max_depths)
+        gap_widths = np.array(gap_widths)
         
-        return run_starts[longest_gap_idx], run_ends[longest_gap_idx]
+        # 1. Find the absolute maximum depth available across all gaps
+        global_max_depth = np.max(gap_max_depths)
+        
+        # 2. Filter down to ONLY the gaps that reach this depth
+        deepest_gap_indices = np.where(gap_max_depths == global_max_depth)[0]
+        
+        # 3. If there are multiple deep gaps, choose the widest one to prevent hitting walls
+        best_gap_idx = deepest_gap_indices[np.argmax(gap_widths[deepest_gap_indices])]
+        
+        return run_starts[best_gap_idx], run_ends[best_gap_idx]
     
     def find_best_point(self, start_i, end_i, ranges):
         """Start_i & end_i are start and end indicies of max-gap range, respectively
@@ -96,23 +114,73 @@ class ReactiveFollowGap(Node):
 	    Naive: Choose the furthest point within ranges and go there
         !we find the CENTER of the max points!
         """
-        # 1. Slice the full array to get only data inside identified max gap.
-        gap = ranges[start_i:end_i]
+        # ======================= Ver 1.0: Absolute Furthest Point (Naive) ==========================
+        # ============= With this logic, the car gets stuck in L-shape traps and tight corners ======
+        # ============= because it always picks the absolute furthest point,            =============
+        # ============= which is often right at the wall vertex.                        =============
 
-        # 2. Find the maximum distance in this gap (likely 3.0m due to clipping)
+        # # 1. Slice the full array to get only data inside identified max gap.
+        # gap = ranges[start_i:end_i]
+
+        # # 2. Find the maximum distance in this gap (likely 3.0m due to clipping)
+        # max_dist = np.max(gap)
+        
+        # # 3. Find ALL indices where the distance equals the max_dist
+        # #    (e.g., if the gap is [2.9, 3.0, 3.0, 3.0, 2.8], this finds indices 1, 2, 3)
+        # max_indices = np.where(gap == max_dist)[0]
+        
+        # # 4. Pick the middle index from these max points
+        # #    (e.g., from indices [1, 2, 3], we pick 2) -> centers the steering trajectory in the open space.
+        # current_max_idx = max_indices[len(max_indices) // 2]
+        
+        # # 5. Convert local gap index back to global ranges index
+        # best_point_idx = start_i + current_max_idx
+        # ====================================== Ver 1.0 END =========================================
+
+        # To SWAP: Just comment out the other Version ❤️❤️❤️
+
+        # ======================= Ver 2.0: Deepest Point with Center Bias (Expert) ===========================
+        # =========== This logic reduces the L-shape trap & tight corner issues by blending two strategies ===
+        # =========== But fails the 3 rectangluar obstacle and later ellipse obstacle ========================
+
+        gap = ranges[start_i:end_i]
+        
+        # Safety catch
+        if len(gap) == 0:
+            return start_i
+
+        # Find the max depth in this gap
         max_dist = np.max(gap)
         
-        # 3. Find ALL indices where the distance equals the max_dist
-        #    (e.g., if the gap is [2.9, 3.0, 3.0, 3.0, 2.8], this finds indices 1, 2, 3)
-        max_indices = np.where(gap == max_dist)[0]
+        # Get all indices that are at (or very close to) the max depth
+        # The -0.1 tolerance groups the deep region together
+        max_indices_local = np.where(gap >= max_dist - 0.1)[0]
         
-        # 4. Pick the middle index from these max points
-        #    (e.g., from indices [1, 2, 3], we pick 2) -> centers the steering trajectory in the open space.
-        current_max_idx = max_indices[len(max_indices) // 2]
+        # Convert local gap indices back to the slice indices
+        max_indices_global = start_i + max_indices_local
         
-        # 5. Convert local gap index back to global ranges index
-        best_point_idx = start_i + current_max_idx
+        # --- 1. FIX THE L-SHAPE TRAP (CENTER BIAS) ---
+        # Instead of picking an arbitrary deep point, find the deep point 
+        # that requires the LEAST steering.
+        # 'len(ranges) // 2' is exactly straight ahead of the car.
+        straight_ahead_idx = len(ranges) // 2
         
+        # Find which of our deep points is closest to straight ahead
+        distances_from_center = np.abs(max_indices_global - straight_ahead_idx)
+        best_deep_idx = max_indices_global[np.argmin(distances_from_center)]
+        
+        # --- 2. FIX THE TIGHT CORNERS (APEX REPULSION) ---
+        # The spatial center of the gap is physically the furthest point from both walls.
+        # By itself it causes wiggling, but blended, it's a great safety buffer.
+        spatial_gap_center = start_i + (len(gap) // 2)
+        
+        # Blend them: 70% deep point (for stability), 30% spatial center (to push wide)
+        # This acts like a magnet pushing the car away from the inner wall vertex.
+        best_point_idx = int((best_deep_idx * 0.7) + (spatial_gap_center * 0.3))
+
+        # ======================================== Ver 2.0 END ================================================
+
+
         return best_point_idx
 
     def lidar_callback(self, data):
@@ -136,42 +204,22 @@ class ReactiveFollowGap(Node):
         # Preprocess only the sliced data
         sliced_ranges = ranges[fov_min_idx:fov_max_idx]
         proc_ranges = self.preprocess_lidar(sliced_ranges)
-
-        # 3. Disparity Extender (Find the closest obstacle to the car. 
-        closest_point_idx = np.argmin(proc_ranges)
-        min_dist = proc_ranges[closest_point_idx]
-        
-        # --- SAFETY BUBBLE ---
-        # Essential for avoiding flat walls where no disparities exist
-        if min_dist < self.bubble_radius:
-            bubble_angle = math.atan(self.bubble_radius / (min_dist + 0.001)) # +0.001 prevents div by 0
-            bubble_idx_window = int(bubble_angle / angle_increment)
-            
-            start_bubble = max(0, closest_point_idx - bubble_idx_window)
-            end_bubble = min(len(proc_ranges), closest_point_idx + bubble_idx_window)
-            proc_ranges[start_bubble:end_bubble] = 0.0
-
-        # Tune parameters ❤️❤️
-        car_width = 0.55 # The width to extend the obstacle (0.5m ~ half car width)
-        disparity_threshold = 0.3  # Minimum jump in distance to consider it a disparity 
-
-        # Vectorized detection: Find differences between adjacent elements
-        # diffs[i] = proc_ranges[i+1] - proc_ranges[i]
+        # KEEP a clean copy for reading true depths BEFORE any zeroing happens
         proc_ranges_copy = proc_ranges.copy()
+
+        # 3. A. Disparity Extender (Find the closest obstacle to the car. 
+        
+            # Vectorized detection: Find differences between adjacent elements
+            # diffs[i] = proc_ranges[i+1] - proc_ranges[i]
         diffs = np.diff(proc_ranges_copy)
 
-        # Get indices where the jump is larger than threshold, returns an array of indices [i, j, k...] where disparities exist
-        disparity_indices = np.where(np.abs(diffs) > disparity_threshold)[0]
+            # Get indices where the jump is larger than threshold, returns an array of indices [i, j, k...] where disparities exist
+        disparity_indices = np.where(np.abs(diffs) > self.disparity_threshold)[0]
 
         # Iterate ONLY over the disparities (usually < 10 points), not the whole array (faster)
         for i in disparity_indices:
             depth_curr = proc_ranges_copy[i]
             depth_next = proc_ranges_copy[i+1]
-
-            # If either point was already zeroed out by the safety bubble, skip it
-            # (optional optimization, keeps logic clean)
-            if depth_curr == 0.0 or depth_next == 0.0:
-                 continue
             
             # Determine closer point to calculate extension angle
             min_depth = min(depth_curr, depth_next)
@@ -181,7 +229,7 @@ class ReactiveFollowGap(Node):
                 min_depth = 0.05
 
             # Calculate how wide (in indices) to extend the safety zero-out
-            angle_width = math.atan(car_width / (min_depth + 0.001)) # +0.001 to prevent div by zero
+            angle_width = math.atan(self.car_width / (min_depth + 0.001)) # +0.001 to prevent div by zero
             idx_width = int(angle_width / angle_increment)
 
             # Extend zeros from the closer edge onto the further edge
@@ -195,6 +243,20 @@ class ReactiveFollowGap(Node):
                 # We need to eat into the gap on the LEFT (previous indices)
                 start_idx = max(0, i - idx_width)
                 proc_ranges[start_idx : i+1] = 0.0
+
+        # B. --- SAFETY BUBBLE (Run this SECOND) ---
+        # Essential for avoiding flat walls where no disparities exist
+        closest_point_idx = np.argmin(proc_ranges_copy)
+        min_dist = proc_ranges_copy[closest_point_idx]
+
+        if min_dist < self.bubble_radius:
+            bubble_angle = math.atan(self.bubble_radius / (min_dist + 0.001)) # +0.001 prevents div by 0
+            bubble_idx_window = int(bubble_angle / angle_increment)
+            
+            start_bubble = max(0, closest_point_idx - bubble_idx_window)
+            end_bubble = min(len(proc_ranges), closest_point_idx + bubble_idx_window)
+            proc_ranges[start_bubble:end_bubble] = 0.0
+
 
         # 4. Find the start/end of the largest consecutive sequence of non-zero points.
         start_i, end_i = self.find_max_gap(proc_ranges)

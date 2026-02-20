@@ -24,15 +24,15 @@ class ReactiveFollowGap(Node):
         self.pub_drive = self.create_publisher(AckermannDriveStamped, drive_topic, 10)
         
         # Parameters (Tune ❤️❤️❤️)
-        self.bubble_radius = 0.7  # Radius of safety bubble in meters    0.7 (critical for L shape trap)
+        self.bubble_radius = 0.4  # Radius of safety bubble in meters    0.7 (critical for L shape trap)
         self.preprocess_conv_size = 3 # Moving average window
         self.max_lidar_dist = 3.5   # Max reliable distance to consider 3.5 
-        self.max_speed = 3.0        # Max speed on straights  
+        self.max_speed = 2.0        # Max speed on straights  
         self.min_speed = 0.5        # Min speed in sharp corners
-        self.fov_angle = np.radians(160) # Only use front 130 degrees
+        self.fov_angle = np.radians(270) # Only use front 130 degrees
         self.prev_steering_angle = 0.0
         self.alpha = 0.2            # Smoothing factor (0.0 to 1.0). Lower = smoother but more lag.
-        self.car_width = 0.35        # The width to extend the obstacle (0.5m ~ half car width)
+        self.car_width = 0.4       # The width to extend the obstacle (0.5m ~ half car width)
         self.disparity_threshold = 0.3  # Minimum jump in distance to consider it a disparity 
 
     def preprocess_lidar(self, ranges):
@@ -119,22 +119,22 @@ class ReactiveFollowGap(Node):
         # ============= because it always picks the absolute furthest point,            =============
         # ============= which is often right at the wall vertex.                        =============
 
-        # # 1. Slice the full array to get only data inside identified max gap.
-        # gap = ranges[start_i:end_i]
+        # 1. Slice the full array to get only data inside identified max gap.
+        gap = ranges[start_i:end_i]
 
-        # # 2. Find the maximum distance in this gap (likely 3.0m due to clipping)
-        # max_dist = np.max(gap)
+        # 2. Find the maximum distance in this gap (likely 3.0m due to clipping)
+        max_dist = np.max(gap)
         
-        # # 3. Find ALL indices where the distance equals the max_dist
-        # #    (e.g., if the gap is [2.9, 3.0, 3.0, 3.0, 2.8], this finds indices 1, 2, 3)
-        # max_indices = np.where(gap == max_dist)[0]
+        # 3. Find ALL indices where the distance equals the max_dist
+        #    (e.g., if the gap is [2.9, 3.0, 3.0, 3.0, 2.8], this finds indices 1, 2, 3)
+        max_indices = np.where(gap == max_dist)[0]
         
-        # # 4. Pick the middle index from these max points
-        # #    (e.g., from indices [1, 2, 3], we pick 2) -> centers the steering trajectory in the open space.
-        # current_max_idx = max_indices[len(max_indices) // 2]
+        # 4. Pick the middle index from these max points
+        #    (e.g., from indices [1, 2, 3], we pick 2) -> centers the steering trajectory in the open space.
+        current_max_idx = max_indices[len(max_indices) // 2]
         
-        # # 5. Convert local gap index back to global ranges index
-        # best_point_idx = start_i + current_max_idx
+        # 5. Convert local gap index back to global ranges index
+        best_point_idx = start_i + current_max_idx
         # ====================================== Ver 1.0 END =========================================
 
         # To SWAP: Just comment out the other Version ❤️❤️❤️
@@ -143,40 +143,40 @@ class ReactiveFollowGap(Node):
         # =========== This logic reduces the L-shape trap & tight corner issues by blending two strategies ===
         # =========== But fails the 3 rectangluar obstacle and later ellipse obstacle ========================
 
-        gap = ranges[start_i:end_i]
+        # gap = ranges[start_i:end_i]
         
-        # Safety catch
-        if len(gap) == 0:
-            return start_i
+        # # Safety catch
+        # if len(gap) == 0:
+        #     return start_i
 
-        # Find the max depth in this gap
-        max_dist = np.max(gap)
+        # # Find the max depth in this gap
+        # max_dist = np.max(gap)
         
-        # Get all indices that are at (or very close to) the max depth
-        # The -0.1 tolerance groups the deep region together
-        max_indices_local = np.where(gap >= max_dist - 0.1)[0]
+        # # Get all indices that are at (or very close to) the max depth
+        # # The -0.1 tolerance groups the deep region together
+        # max_indices_local = np.where(gap >= max_dist - 0.1)[0]
         
-        # Convert local gap indices back to the slice indices
-        max_indices_global = start_i + max_indices_local
+        # # Convert local gap indices back to the slice indices
+        # max_indices_global = start_i + max_indices_local
         
-        # --- 1. FIX THE L-SHAPE TRAP (CENTER BIAS) ---
-        # Instead of picking an arbitrary deep point, find the deep point 
-        # that requires the LEAST steering.
-        # 'len(ranges) // 2' is exactly straight ahead of the car.
-        straight_ahead_idx = len(ranges) // 2
+        # # --- 1. FIX THE L-SHAPE TRAP (CENTER BIAS) ---
+        # # Instead of picking an arbitrary deep point, find the deep point 
+        # # that requires the LEAST steering.
+        # # 'len(ranges) // 2' is exactly straight ahead of the car.
+        # straight_ahead_idx = len(ranges) // 2
         
-        # Find which of our deep points is closest to straight ahead
-        distances_from_center = np.abs(max_indices_global - straight_ahead_idx)
-        best_deep_idx = max_indices_global[np.argmin(distances_from_center)]
+        # # Find which of our deep points is closest to straight ahead
+        # distances_from_center = np.abs(max_indices_global - straight_ahead_idx)
+        # best_deep_idx = max_indices_global[np.argmin(distances_from_center)]
         
-        # --- 2. FIX THE TIGHT CORNERS (APEX REPULSION) ---
-        # The spatial center of the gap is physically the furthest point from both walls.
-        # By itself it causes wiggling, but blended, it's a great safety buffer.
-        spatial_gap_center = start_i + (len(gap) // 2)
+        # # --- 2. FIX THE TIGHT CORNERS (APEX REPULSION) ---
+        # # The spatial center of the gap is physically the furthest point from both walls.
+        # # By itself it causes wiggling, but blended, it's a great safety buffer.
+        # spatial_gap_center = start_i + (len(gap) // 2)
         
-        # Blend them: 70% deep point (for stability), 30% spatial center (to push wide)
-        # This acts like a magnet pushing the car away from the inner wall vertex.
-        best_point_idx = int((best_deep_idx * 0.7) + (spatial_gap_center * 0.3))
+        # # Blend them: 70% deep point (for stability), 30% spatial center (to push wide)
+        # # This acts like a magnet pushing the car away from the inner wall vertex.
+        # best_point_idx = int((best_deep_idx * 0.7) + (spatial_gap_center * 0.3))
 
         # ======================================== Ver 2.0 END ================================================
 

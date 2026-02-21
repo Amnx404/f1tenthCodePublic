@@ -1,130 +1,72 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
-
-import math
 import numpy as np
 from sensor_msgs.msg import LaserScan
-from ackermann_msgs.msg import AckermannDriveStamped, AckermannDrive
+from ackermann_msgs.msg import AckermannDriveStamped
 from visualization_msgs.msg import MarkerArray, Marker
 from geometry_msgs.msg import Point
 
+
 class ReactiveFollowGap(Node):
-    """
-    Follow the Gap
-    """
+
     def __init__(self):
-        super().__init__('team1_gap_follow_node')
-        lidarscan_topic = '/scan'
-        drive_topic = '/drive'
+        super().__init__('reactive_node')
 
-        # print its running
-        self.get_logger().info('ReactiveFollowGap is running')
+        self.scan_sub = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.lidar_callback,
+            10
+        )
 
-        self.sub_scan  = self.create_subscription(LaserScan, lidarscan_topic, self.lidar_callback, 10)
-        self.pub_drive = self.create_publisher(AckermannDriveStamped, drive_topic, 10)
-        # Visualization: pre-process (smoothed) and post-process (disparity + bubble) scans, plus gap/best point
-        self.pub_scan_before = self.create_publisher(LaserScan, '/gap_viz_scan_before', 10)
-        self.pub_scan_proc  = self.create_publisher(LaserScan, '/gap_viz_scan_proc', 10)
-        self.pub_gap_viz    = self.create_publisher(MarkerArray, '/gap_viz', 10)
+        self.drive_pub = self.create_publisher(
+            AckermannDriveStamped,
+            '/drive',
+            10
+        )
 
-        # ── Tunable Parameters  ──────────────────────────────────────────
-        self.bubble_radius        = 0.15              # Safety bubble radius (m)
-        self.preprocess_conv_size = 10               # Smoothing window size
-        self.max_lidar_dist       = 5             # Max LiDAR distance (m)
-        self.max_speed            = 4              # Max speed on straights (m/s)
-        self.min_speed            = 1.5               # Min speed at sharp turns (m/s)
-        self.fov_angle            = np.radians(190)  # Total field of view (rad)
-        self.car_width            = 0.35             # Car width for disparity extension (m)
-        self.disparity_threshold  = 0.5              # Min distance jump to trigger extension (m)
-        self.far_guide_gain       = 0.25             # Far-field balance gain (keep small)
-        self.alpha                = 0.35             # EMA smoothing (0=slowest, 1=fastest)
-        self.max_steer_step       = np.radians(25.0) # Max steering change per callback (rad)
-        self.side_clearance_min   = 0.2            # Min side clearance to allow turning (m)
-        self.steer_momentum       = 0.4              # How much to favour gaps in the current steer direction (0=none, 1=strong)
-        # ──────────────────────────────────────────────────────────────────
+        # Visualization publishers
+        self.viz_scan_pub = self.create_publisher(
+            LaserScan,
+            '/gap_viz_scan',
+            10
+        )
+        self.viz_gap_pub = self.create_publisher(
+            MarkerArray,
+            '/gap_viz',
+            10
+        )
 
-        self.prev_steering_angle = 0.0
+        # Vehicle parameters
+        self.max_speed = 4.0
+        self.car_width = 0.38
+        self.wheelbase = 0.33
+        self.max_brake_accel = 3.0
+        self.max_lat_accel = 4.0
 
-    def preprocess_lidar(self, ranges):
-        proc = np.array(ranges, dtype=float)
-        proc = np.nan_to_num(proc, posinf=self.max_lidar_dist, nan=0.0)
-        proc = np.clip(proc, 0.0, self.max_lidar_dist)
-        kernel = np.ones(self.preprocess_conv_size) / self.preprocess_conv_size
-        proc = np.convolve(proc, kernel, 'same')
-        return proc
+        self.obstacle_threshold = 0.1  # treat anything closer than this as obstacle
+        
+        # Low-pass filter for smooth steering
+        self.prev_steering = 0.2
+        
+        # Deadband parameters for straight-line smoothing
+        self.deadband_threshold = 0.001  # radians (~5.73 degrees) - ignore small steering commands
+        self.straight_confidence_counter = 0  # counter for how many consecutive small steering commands
+        self.straight_confidence_threshold = 3  # need this many consecutive small steerings to engage deadband
+        self.prev_raw_steering = 0.0  # store raw steering before deadband
+        
+        # Hysteresis for turning mode
+        self.was_turning = False
 
-    def sector_indices(self, angle_min, angle_increment, total_len, start_angle, end_angle):
-        """Convert angle range to clamped array indices."""
-        s = int((start_angle - angle_min) / angle_increment)
-        e = int((end_angle   - angle_min) / angle_increment)
-        s = max(0, min(total_len, s))
-        e = max(0, min(total_len, e))
-        return (s, e) if s <= e else (e, s)
-
-    def find_max_gap(self, free_space_ranges, preferred_idx=None):
-        """Return (start, end) indices of the best-scored gap.
-        Score = depth + width - heading_penalty + momentum_bonus.
-        preferred_idx biases toward gaps aligned with current steering.
-        """
-        mask  = free_space_ranges > 0.1
-        dmask = np.diff(mask.astype(int))
-        run_starts = np.where(dmask ==  1)[0] + 1
-        run_ends   = np.where(dmask == -1)[0] + 1
-        if mask[0]:  run_starts = np.insert(run_starts, 0, 0)
-        if mask[-1]: run_ends   = np.append(run_ends, len(free_space_ranges))
-
-        if len(run_starts) == 0:
-            best = int(np.argmax(free_space_ranges))
-            return best, best + 1
-
-        center_idx = len(free_space_ranges) // 2
-        if preferred_idx is None:
-            preferred_idx = center_idx
-        best_gap, best_score = (run_starts[0], run_ends[0]), -np.inf
-
-        for s, e in zip(run_starts, run_ends):
-            if e <= s:
-                continue
-            gap_mid = (s + e) // 2
-            gap_slice = free_space_ranges[s:e]
-            gap_depth       = float(np.max(gap_slice)) / max(self.max_lidar_dist, 1e-6)
-            gap_width       = float(e - s) / max(len(free_space_ranges), 1)
-            heading_penalty = float(abs(gap_mid - center_idx)) / max(center_idx, 1)
-            momentum_bonus  = 1.0 - float(abs(gap_mid - preferred_idx)) / max(len(free_space_ranges), 1)
-            score = (1.2 * gap_depth + 0.9 * gap_width
-                     - 0.25 * heading_penalty
-                     + self.steer_momentum * momentum_bonus)
-            if score > best_score:
-                best_score, best_gap = score, (s, e)
-
-        return best_gap
-
-    def find_best_point(self, start_i, end_i, ranges, preferred_idx=None):
-        """Return index of best target within the gap.
-        Blends deepest point, spatial center, and steering momentum.
-        """
-        gap = ranges[start_i:end_i]
-        if len(gap) == 0:
-            return start_i
-
-        straight_ahead = len(ranges) // 2
-        if preferred_idx is None:
-            preferred_idx = straight_ahead
-
-        max_dist    = np.max(gap)
-        deep_local  = np.where(gap >= max_dist - 0.1)[0]
-        deep_global = start_i + deep_local
-
-        best_deep      = deep_global[np.argmin(np.abs(deep_global - preferred_idx))]
-        spatial_center = start_i + len(gap) // 2
-
-        return int(0.5 * best_deep + 0.2 * spatial_center + 0.3 * np.clip(preferred_idx, start_i, end_i - 1))
+    # ------------------------------------------------
+    # Visualization helpers
+    # ------------------------------------------------
 
     def _index_to_xy(self, index, range_val, angle_min, angle_increment):
         """Laser frame: angle 0 = forward (+x), left = +y."""
         angle = angle_min + index * angle_increment
-        return (range_val * math.cos(angle), range_val * math.sin(angle))
+        return (range_val * np.cos(angle), range_val * np.sin(angle))
 
     def _publish_scan_viz(self, data, ranges_full):
         """Publish a LaserScan with same metadata as data but ranges = ranges_full."""
@@ -141,178 +83,385 @@ class ReactiveFollowGap(Node):
         msg.ranges = [float(r) for r in ranges_full]
         return msg
 
-    def _publish_gap_markers(self, data, proc, start_i, end_i, best_idx_slice, fov_min_idx):
-        """Publish gap segment (line) and best point (sphere) in scan frame."""
+    def _publish_gap_markers(self, data, front, start, gap_start, gap_end, best, frame_id='laser', speed=None, steering_angle=None):
+        """Publish gap segment (line), best point (sphere), target arrow, and optional speed/steering text."""
         angle_min = data.angle_min
         angle_inc = data.angle_increment
-        frame_id = data.header.frame_id or 'base_link'
+        stamp = self.get_clock().now().to_msg()
 
-        # Indices in full frame for angles; ranges from slice
-        start_full = start_i + fov_min_idx
-        end_full   = end_i - 1 + fov_min_idx  # end_i is exclusive, last gap index is end_i-1
-        r0 = float(proc[start_i])
-        r1 = float(proc[end_i - 1]) if end_i > start_i else r0
-        best_local = best_idx_slice - fov_min_idx
-        r_best = float(proc[best_local]) if 0 <= best_local < len(proc) else 0.0
+        # Indices and ranges in full scan
+        idx_start = start + gap_start
+        idx_end = start + gap_end
+        idx_best = start + best
+        r_start = float(front[gap_start]) if gap_start < len(front) else 0.0
+        r_end = float(front[gap_end]) if gap_end < len(front) else 0.0
+        r_best = float(front[best]) if best < len(front) else 0.0
 
-        x0, y0 = self._index_to_xy(start_full, r0, angle_min, angle_inc)
-        x1, y1 = self._index_to_xy(end_full, r1, angle_min, angle_inc)
-        xb, yb = self._index_to_xy(best_idx_slice, r_best, angle_min, angle_inc)
+        x0, y0 = self._index_to_xy(idx_start, r_start, angle_min, angle_inc)
+        x1, y1 = self._index_to_xy(idx_end, r_end, angle_min, angle_inc)
+        xb, yb = self._index_to_xy(idx_best, r_best, angle_min, angle_inc)
 
         ma = MarkerArray()
-        # Gap line
-        gap_m = Marker()
-        gap_m.header.frame_id = frame_id
-        gap_m.header.stamp = self.get_clock().now().to_msg()
-        gap_m.ns = 'gap'
-        gap_m.id = 0
-        gap_m.type = Marker.LINE_STRIP
-        gap_m.action = Marker.ADD
-        gap_m.scale.x = 0.15
-        gap_m.color.r = 0.0
-        gap_m.color.g = 1.0
-        gap_m.color.b = 0.0
-        gap_m.color.a = 1.0
-        gap_m.points = [Point(x=x0, y=y0, z=0.0), Point(x=x1, y=y1, z=0.0)]
-        ma.markers.append(gap_m)
-        # Best point
+        # ----- Gap visualization -----
+        # Gap wedge (filled triangle: origin -> gap_start -> gap_end) - semi-transparent green
+        gap_wedge = Marker()
+        gap_wedge.header.frame_id = frame_id
+        gap_wedge.header.stamp = stamp
+        gap_wedge.ns = 'gap'
+        gap_wedge.id = 0
+        gap_wedge.type = Marker.TRIANGLE_LIST
+        gap_wedge.action = Marker.ADD
+        gap_wedge.scale.x = 1.0
+        gap_wedge.scale.y = 1.0
+        gap_wedge.scale.z = 1.0
+        gap_wedge.color.r = 0.0
+        gap_wedge.color.g = 0.8
+        gap_wedge.color.b = 0.2
+        gap_wedge.color.a = 0.35
+        # One triangle: origin, gap_start, gap_end
+        gap_wedge.points = [
+            Point(x=0.0, y=0.0, z=0.0),
+            Point(x=x0, y=y0, z=0.0),
+            Point(x=x1, y=y1, z=0.0),
+        ]
+        ma.markers.append(gap_wedge)
+        # Gap boundary line (green)
+        gap_line = Marker()
+        gap_line.header.frame_id = frame_id
+        gap_line.header.stamp = stamp
+        gap_line.ns = 'gap'
+        gap_line.id = 1
+        gap_line.type = Marker.LINE_STRIP
+        gap_line.action = Marker.ADD
+        gap_line.scale.x = 0.12
+        gap_line.color.r = 0.0
+        gap_line.color.g = 1.0
+        gap_line.color.b = 0.0
+        gap_line.color.a = 1.0
+        gap_line.points = [Point(x=x0, y=y0, z=0.0), Point(x=x1, y=y1, z=0.0)]
+        ma.markers.append(gap_line)
+        # Gap label at center of gap
+        gap_center_x = (x0 + x1) / 2
+        gap_center_y = (y0 + y1) / 2
+        gap_text = Marker()
+        gap_text.header.frame_id = frame_id
+        gap_text.header.stamp = stamp
+        gap_text.ns = 'gap'
+        gap_text.id = 2
+        gap_text.type = Marker.TEXT_VIEW_FACING
+        gap_text.action = Marker.ADD
+        gap_text.pose.position.x = gap_center_x
+        gap_text.pose.position.y = gap_center_y
+        gap_text.pose.position.z = 0.2
+        gap_text.pose.orientation.w = 1.0
+        gap_text.scale.z = 0.12
+        gap_text.color.r = 0.0
+        gap_text.color.g = 1.0
+        gap_text.color.b = 0.0
+        gap_text.color.a = 1.0
+        gap_text.text = 'Gap'
+        ma.markers.append(gap_text)
+        # ----- Goal visualization -----
+        # Goal point (red sphere)
         best_m = Marker()
         best_m.header.frame_id = frame_id
-        best_m.header.stamp = self.get_clock().now().to_msg()
-        best_m.ns = 'gap'
-        best_m.id = 1
+        best_m.header.stamp = stamp
+        best_m.ns = 'goal'
+        best_m.id = 0
         best_m.type = Marker.SPHERE
         best_m.action = Marker.ADD
         best_m.pose.position.x = xb
         best_m.pose.position.y = yb
         best_m.pose.position.z = 0.0
         best_m.pose.orientation.w = 1.0
-        best_m.scale.x = best_m.scale.y = best_m.scale.z = 0.5
+        best_m.scale.x = best_m.scale.y = best_m.scale.z = 0.45
         best_m.color.r = 1.0
-        best_m.color.g = 0.0
+        best_m.color.g = 0.2
         best_m.color.b = 0.0
         best_m.color.a = 1.0
         ma.markers.append(best_m)
-        self.pub_gap_viz.publish(ma)
+        # Goal label at best point
+        goal_text = Marker()
+        goal_text.header.frame_id = frame_id
+        goal_text.header.stamp = stamp
+        goal_text.ns = 'goal'
+        goal_text.id = 1
+        goal_text.type = Marker.TEXT_VIEW_FACING
+        goal_text.action = Marker.ADD
+        goal_text.pose.position.x = xb
+        goal_text.pose.position.y = yb
+        goal_text.pose.position.z = 0.35
+        goal_text.pose.orientation.w = 1.0
+        goal_text.scale.z = 0.14
+        goal_text.color.r = 1.0
+        goal_text.color.g = 0.9
+        goal_text.color.b = 0.0
+        goal_text.color.a = 1.0
+        goal_text.text = 'Goal'
+        ma.markers.append(goal_text)
+        # Target direction arrow (origin -> best point)
+        arrow_m = Marker()
+        arrow_m.header.frame_id = frame_id
+        arrow_m.header.stamp = stamp
+        arrow_m.ns = 'hud'
+        arrow_m.id = 0
+        arrow_m.type = Marker.ARROW
+        arrow_m.action = Marker.ADD
+        arrow_m.points = [Point(x=0.0, y=0.0, z=0.0), Point(x=xb, y=yb, z=0.0)]
+        arrow_m.scale.x = 0.08
+        arrow_m.scale.y = 0.12
+        arrow_m.color.r = 0.2
+        arrow_m.color.g = 0.6
+        arrow_m.color.b = 1.0
+        arrow_m.color.a = 0.9
+        ma.markers.append(arrow_m)
+        # Speed/steering text (in front of robot for readability)
+        if speed is not None and steering_angle is not None:
+            text_m = Marker()
+            text_m.header.frame_id = frame_id
+            text_m.header.stamp = stamp
+            text_m.ns = 'hud'
+            text_m.id = 1
+            text_m.type = Marker.TEXT_VIEW_FACING
+            text_m.action = Marker.ADD
+            text_m.pose.position.x = 0.5
+            text_m.pose.position.y = 0.0
+            text_m.pose.position.z = 0.3
+            text_m.pose.orientation.w = 1.0
+            text_m.scale.z = 0.15
+            text_m.color.r = 1.0
+            text_m.color.g = 1.0
+            text_m.color.b = 1.0
+            text_m.color.a = 1.0
+            text_m.text = f'speed={speed:.2f} m/s  steer={np.degrees(steering_angle):.1f} deg'
+            ma.markers.append(text_m)
+        self.viz_gap_pub.publish(ma)
+
+    # ------------------------------------------------
+
+    def preprocess(self, ranges):
+        ranges = np.array(ranges)
+        ranges[np.isnan(ranges)] = 0.0
+        ranges[np.isinf(ranges)] = 0.0
+        ranges = np.clip(ranges, 0.0, 10.0)
+
+        ranges = np.convolve(ranges, np.ones(5)/5, mode='same')
+
+        return ranges
+
+    # --------------------------------------------------
+    
+    def apply_steering_deadband(self, raw_steering):
+        """
+        Apply a deadband to steering for straight-line driving.
+        Small steering angles get pulled toward zero to reduce oscillations.
+        """
+        abs_steering = abs(raw_steering)
+        
+        # Check if steering command is very small
+        if abs_steering < self.deadband_threshold:
+            self.straight_confidence_counter += 1
+        else:
+            self.straight_confidence_counter = 0
+        
+        # If we've had several consecutive small steering commands,
+        # we're probably on a straight - pull to zero
+        if self.straight_confidence_counter >= self.straight_confidence_threshold:
+            # Progressive deadband: smooth transition to zero
+            if abs_steering < self.deadband_threshold * 0.5:
+                # Very small -> completely zero
+                return 0.0
+            else:
+                # Scale down gradually
+                scale_factor = (abs_steering - self.deadband_threshold * 0.5) / (self.deadband_threshold * 0.5)
+                return np.sign(raw_steering) * abs_steering * max(0, scale_factor)
+        else:
+            # Not confident we're on a straight yet - pass through
+            return raw_steering
+
+    # --------------------------------------------------
+
+    def inflate_obstacles(self, ranges, angle_increment):
+        inflated = np.copy(ranges)
+
+        for i in range(len(ranges)):
+
+            d = ranges[i]
+
+            if 0.05 < d < self.obstacle_threshold:
+
+                # angular width needed for half car
+                safety_angle = np.arctan(
+                    (self.car_width / 2.0) / max(d, 0.01)
+                )
+
+                beams = int(safety_angle / angle_increment)
+
+                start = max(0, i - beams)
+                end = min(len(ranges)-1, i + beams)
+
+                inflated[start:end+1] = 0.0
+
+        return inflated
+
+    # --------------------------------------------------
+
+    def find_max_gap(self, ranges):
+
+        max_len = 0
+        max_start = 0
+        max_end = 0
+
+        curr_start = 0
+        curr_len = 0
+
+        for i in range(len(ranges)):
+            if ranges[i] > 0.05:
+                if curr_len == 0:
+                    curr_start = i
+                curr_len += 1
+            else:
+                if curr_len > max_len:
+                    max_len = curr_len
+                    max_start = curr_start
+                    max_end = i - 1
+                curr_len = 0
+
+        if curr_len > max_len:
+            max_start = curr_start
+            max_end = len(ranges) - 1
+
+        return max_start, max_end
+
+    # --------------------------------------------------
 
     def lidar_callback(self, data):
-        ranges          = np.array(data.ranges)
-        angle_increment = data.angle_increment
-        angle_min       = data.angle_min
-        n               = len(ranges)
 
-        # ── 1. FOV Slice ──────────────────────────────────────────────────
-        fov_min_idx = max(0, int((-self.fov_angle / 2 - angle_min) / angle_increment))
-        fov_max_idx = min(n, int(( self.fov_angle / 2 - angle_min) / angle_increment))
+        ranges = self.preprocess(data.ranges)
 
-        proc      = self.preprocess_lidar(ranges[fov_min_idx:fov_max_idx])
-        proc_copy = proc.copy()  # clean reference for bubble & disparity
+        # restrict to front 180°
+        total = len(ranges)
+        center = total // 2
+        #fov = total * 3 // 16   # 135 degrees
+        fov = total * 29 // 144   # 145 degrees
 
-        # ── 2. Disparity Extension ────────────────────────────────────────
-        # At edges between close obstacles and open space, extend the close
-        # value into the gap to prevent the car from clipping corners.
-        for i in np.where(np.abs(np.diff(proc_copy)) > self.disparity_threshold)[0]:
-            d0, d1 = proc_copy[i], proc_copy[i + 1]
-            md = max(min(d0, d1), 0.05)
-            w  = int(math.atan(self.car_width / (md + 0.001)) / angle_increment)
-            if d0 < d1:   # obstacle on left side → extend rightward into gap
-                proc[i + 1 : min(len(proc), i + 1 + w)] = 0.0
-            else:          # obstacle on right side → extend leftward into gap
-                proc[max(0, i - w + 1) : i + 1] = 0.0
+        start = center - fov
+        end = center + fov
 
-        # ── 3. Safety Bubble ──────────────────────────────────────────────
-        # Zero out an angular region around the single closest point.
-        closest_idx = int(np.argmin(proc_copy))
-        min_dist    = proc_copy[closest_idx]
-        if min_dist < self.bubble_radius:
-            bw = int(math.atan(self.bubble_radius / (min_dist + 0.001)) / angle_increment)
-            proc[max(0, closest_idx - bw) : min(len(proc), closest_idx + bw)] = 0.0
+        front = ranges[start:end]
 
-        # ── 4. Find Gap & Best Point ──────────────────────────────────────
-        steer_offset   = int(self.prev_steering_angle / angle_increment)
-        preferred_idx  = len(proc) // 2 + steer_offset
-        preferred_idx  = max(0, min(len(proc) - 1, preferred_idx))
-        start_i, end_i = self.find_max_gap(proc, preferred_idx)
-        best_idx       = self.find_best_point(start_i, end_i, proc, preferred_idx) + fov_min_idx
+        # Inflate obstacles properly
+        front = self.inflate_obstacles(front,
+                                        data.angle_increment)
 
-        # ── 4b. Visualization: scan before (smoothed only) and after (disparity + bubble), gap/best point
-        full_before = np.array(ranges, dtype=float)
-        full_before[fov_min_idx:fov_max_idx] = proc_copy
-        full_proc = np.array(ranges, dtype=float)
-        full_proc[fov_min_idx:fov_max_idx] = proc
-        self.pub_scan_before.publish(self._publish_scan_viz(data, full_before))
-        self.pub_scan_proc.publish(self._publish_scan_viz(data, full_proc))
-        self._publish_gap_markers(data, proc, start_i, end_i, best_idx, fov_min_idx)
+        # Find max gap
+        gap_start, gap_end = self.find_max_gap(front)
 
-        # ── 5. Raw Steering Angle ─────────────────────────────────────────
-        steering_angle = angle_min + best_idx * angle_increment
-        raw_gap_steer  = steering_angle  # before far-field bias
-
-        # ── 6. Mild Far-Field Balance ─────────────────────────────────────
-        proc_full = self.preprocess_lidar(ranges)
-        front_s, front_e = self.sector_indices(angle_min, angle_increment, n, -np.radians(10),  np.radians(10))
-        far_l_s, far_l_e = self.sector_indices(angle_min, angle_increment, n,  np.radians(22),  np.radians(75))
-        far_r_s, far_r_e = self.sector_indices(angle_min, angle_increment, n, -np.radians(75), -np.radians(22))
-
-        far_left    = float(np.percentile(proc_full[far_l_s:far_l_e], 80)) if far_l_e > far_l_s else self.max_lidar_dist
-        far_right   = float(np.percentile(proc_full[far_r_s:far_r_e], 80)) if far_r_e > far_r_s else self.max_lidar_dist
-        forward_cl  = float(np.min(proc_full[front_s:front_e]))             if front_e > front_s else self.max_lidar_dist
-        far_balance = np.clip((far_left - far_right) / max(self.max_lidar_dist, 1e-6), -1.0, 1.0)
-        danger      = np.clip((1.5 - forward_cl) / 1.5, 0.0, 1.0)
-        steering_angle += self.far_guide_gain * (1.0 + danger) * far_balance
-
-        # ── 7. Rate Limit + EMA Smoothing ────────────────────────────────
-        limited = self.prev_steering_angle + np.clip(
-            steering_angle - self.prev_steering_angle,
-            -self.max_steer_step, self.max_steer_step
-        )
-        self.prev_steering_angle = self.alpha * limited + (1.0 - self.alpha) * self.prev_steering_angle
-        steering_angle = self.prev_steering_angle
-
-        # ── 7b. Side-Clearance Gate ─────────────────────────────────────
-        left_s, left_e   = self.sector_indices(angle_min, angle_increment, n, np.radians(80), np.radians(100))
-        right_s, right_e = self.sector_indices(angle_min, angle_increment, n, -np.radians(100), -np.radians(80))
-        left_dist  = float(np.min(proc_full[left_s:left_e]))  if left_e  > left_s  else self.max_lidar_dist
-        right_dist = float(np.min(proc_full[right_s:right_e])) if right_e > right_s else self.max_lidar_dist
-
-        if steering_angle > 0 and left_dist < self.side_clearance_min:
-            steering_angle = -abs(steering_angle)
-        elif steering_angle < 0 and right_dist < self.side_clearance_min:
-            steering_angle = abs(steering_angle)
-
-        # ── 8. Speed Control ──────────────────────────────────────────────
-        abs_steer = abs(steering_angle)
-        if abs_steer < np.radians(10):
-            speed = self.max_speed
-        elif abs_steer > np.radians(20):
-            speed = self.min_speed
+        if gap_end <= gap_start:
+            best = len(front)//2
         else:
-            ratio = (abs_steer - np.radians(10)) / np.radians(10)
-            speed = self.max_speed - ratio * (self.max_speed - self.min_speed)
+            gap_ranges = front[gap_start:gap_end+1]
 
-        # ── DEBUG LOG ─────────────────────────────────────────────────────
-        self.get_logger().info(
-            f"close={min_dist:.2f}m | "
-            f"gap=[{start_i},{end_i}](w={end_i-start_i}) | "
-            f"gap_steer={np.degrees(raw_gap_steer):.1f}° | "
-            f"far_balance={far_balance:+.2f}(L={far_left:.1f} R={far_right:.1f}) fwd={forward_cl:.2f}m | "
-            f"side(L={left_dist:.2f} R={right_dist:.2f}) | "
-            f"final={np.degrees(steering_angle):.1f}° | "
-            f"speed={speed:.2f}m/s"
+            indices = np.arange(gap_start, gap_end+1)
+
+            # Add bias for farther gaps to encourage turning
+            gap_center = (gap_start + gap_end) // 2
+            center_idx = len(front) // 2
+            
+            # Calculate how far this gap is from center (0 to 1)
+            off_center_factor = abs(gap_center - center_idx) / len(front)
+            
+            # Add turning bias - gaps far from center get extra weight
+            turning_bias = 2.26 * off_center_factor
+            
+            weights = gap_ranges * turning_bias
+            
+            # ===== SAFETY CHECK FOR DIVISION BY ZERO =====
+            weights_sum = np.sum(weights)
+            if weights_sum > 1e-6:  # Small threshold to avoid division by zero
+                weighted_index = np.sum(indices * weights) / weights_sum
+            else:
+                # Fallback to center of gap if all weights are near zero
+                weighted_index = np.mean(indices)
+            # ===== END OF SAFETY CHECK =====
+
+            best = int(weighted_index)
+
+        global_index = best + start
+
+        # ----- Visualization: processed scan (gap markers published after speed/steering) -----
+        ranges_full = np.array(self.preprocess(data.ranges), dtype=float)
+        ranges_full[start:end] = front
+        self.viz_scan_pub.publish(self._publish_scan_viz(data, ranges_full))
+
+        raw_steering_angle = (
+            data.angle_min +
+            global_index * data.angle_increment
         )
-        # ── DEBUG LOG END ─────────────────────────────────────────────────
+        
+        # Store raw steering before filtering
+        self.prev_raw_steering = raw_steering_angle
 
-        # ── 9. Publish ────────────────────────────────────────────────────
+        # ---------------- SPEED CALCULATION ----------------
+        
+        # Get minimum distance in front (for safety)
+        min_dist_front = np.min(front[front > 0.05]) if np.any(front > 0.05) else 3.0
+        
+        # Check if we're approaching a corner
+        center_idx = len(front) // 2
+        gap_center = (gap_start + gap_end) // 2
+        
+        # Hysteresis for turning mode
+        raw_turning = abs(gap_center - center_idx) > len(front) * 0.08
+        if raw_turning:
+            self.was_turning = True
+        elif abs(gap_center - center_idx) < len(front) * 0.05:
+            self.was_turning = False
+        is_turning = self.was_turning
+        
+        # Look at the path we're about to take
+        lookahead_idx = 20
+        if raw_steering_angle > 0:  # Turning right
+            path_slice = front[max(0, center_idx - lookahead_idx):center_idx]
+        else:  # Turning left
+            path_slice = front[center_idx:min(len(front), center_idx + lookahead_idx)]
+        
+        path_clearance = np.min(path_slice) if len(path_slice) > 0 and np.any(path_slice > 0.05) else min_dist_front
+        
+        # Progressive speed based on situation
+        if is_turning and min_dist_front < 2.5:
+            corner_speed = self.max_speed * 0.4
+            turn_sharpness = abs(gap_center - center_idx) / len(front)
+            corner_speed *= (1.0 - 0.3 * turn_sharpness)
+            speed = max(corner_speed, 0.1)
+        else:
+            v_brake = min(self.max_speed, np.sqrt(2 * self.max_brake_accel * path_clearance) * 0.45)
+            curvature = np.tan(raw_steering_angle) / self.wheelbase
+            if abs(curvature) < 1e-4:
+                v_curve = self.max_speed
+            else:
+                v_curve = np.sqrt(self.max_lat_accel / abs(curvature))
+            speed = min(self.max_speed, max(v_brake, 0.1), v_curve)
+        
+        # Apply deadband and low-pass filter
+        steering_with_deadband = self.apply_steering_deadband(raw_steering_angle)
+        alpha = 0.87
+        steering_angle = alpha * steering_with_deadband + (1 - alpha) * self.prev_steering
+        self.prev_steering = steering_angle
+
+        # Publish drive command
         msg = AckermannDriveStamped()
-        msg.header.stamp         = self.get_clock().now().to_msg()
-        msg.drive.speed          = float(speed) #speed)
+        msg.drive.speed = float(speed)
         msg.drive.steering_angle = float(steering_angle)
-        self.pub_drive.publish(msg)
+        self.drive_pub.publish(msg)
+
+        # Visualization: gap + best point + arrow + speed/steering text
+        frame_id = data.header.frame_id if data.header.frame_id else 'laser'
+        self._publish_gap_markers(data, front, start, gap_start, gap_end, best, frame_id, speed=speed, steering_angle=steering_angle)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    print("ReactiveFollowGap Initialized")
     node = ReactiveFollowGap()
     rclpy.spin(node)
     node.destroy_node()

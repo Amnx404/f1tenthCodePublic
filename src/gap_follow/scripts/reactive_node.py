@@ -32,14 +32,16 @@ class ReactiveFollowGap(Node):
         self.bubble_radius        = 0.15              # Safety bubble radius (m)
         self.preprocess_conv_size = 10               # Smoothing window size
         self.max_lidar_dist       = 5             # Max LiDAR distance (m)
-        self.max_speed            = 4              # Max speed on straights (m/s)
+        self.max_speed            = 5              # Max speed on straights (m/s)
         self.min_speed            = 1.5               # Min speed at sharp turns (m/s)
-        self.fov_angle            = np.radians(180)  # Total field of view (rad)
+        self.fov_angle            = np.radians(270)  # Total field of view (rad)
         self.car_width            = 0.35             # Car width for disparity extension (m)
         self.disparity_threshold  = 0.5              # Min distance jump to trigger extension (m)
         self.far_guide_gain       = 0.25             # Far-field balance gain (keep small)
         self.alpha                = 0.35             # EMA smoothing (0=slowest, 1=fastest)
         self.max_steer_step       = np.radians(25.0) # Max steering change per callback (rad)
+        self.side_clearance_min   = 0.4             # Min side clearance to allow turning (m)
+        self.steer_momentum       = 0.4              # How much to favour gaps in the current steer direction (0=none, 1=strong)
         # ──────────────────────────────────────────────────────────────────
 
         self.prev_steering_angle = 0.0
@@ -60,9 +62,10 @@ class ReactiveFollowGap(Node):
         e = max(0, min(total_len, e))
         return (s, e) if s <= e else (e, s)
 
-    def find_max_gap(self, free_space_ranges):
+    def find_max_gap(self, free_space_ranges, preferred_idx=None):
         """Return (start, end) indices of the best-scored gap.
-        Score = depth + width - heading_penalty (prefers deep, wide, forward gaps).
+        Score = depth + width - heading_penalty + momentum_bonus.
+        preferred_idx biases toward gaps aligned with current steering.
         """
         mask  = free_space_ranges > 0.1
         dmask = np.diff(mask.astype(int))
@@ -71,48 +74,52 @@ class ReactiveFollowGap(Node):
         if mask[0]:  run_starts = np.insert(run_starts, 0, 0)
         if mask[-1]: run_ends   = np.append(run_ends, len(free_space_ranges))
 
-        # Fallback: no gap found → aim at the single furthest point
         if len(run_starts) == 0:
             best = int(np.argmax(free_space_ranges))
             return best, best + 1
 
         center_idx = len(free_space_ranges) // 2
+        if preferred_idx is None:
+            preferred_idx = center_idx
         best_gap, best_score = (run_starts[0], run_ends[0]), -np.inf
 
         for s, e in zip(run_starts, run_ends):
             if e <= s:
                 continue
+            gap_mid = (s + e) // 2
             gap_slice = free_space_ranges[s:e]
             gap_depth       = float(np.max(gap_slice)) / max(self.max_lidar_dist, 1e-6)
             gap_width       = float(e - s) / max(len(free_space_ranges), 1)
-            heading_penalty = float(abs((s + e) // 2 - center_idx)) / max(center_idx, 1)
-            score = 1.2 * gap_depth + 0.9 * gap_width - 0.25 * heading_penalty
+            heading_penalty = float(abs(gap_mid - center_idx)) / max(center_idx, 1)
+            momentum_bonus  = 1.0 - float(abs(gap_mid - preferred_idx)) / max(len(free_space_ranges), 1)
+            score = (1.2 * gap_depth + 0.9 * gap_width
+                     - 0.25 * heading_penalty
+                     + self.steer_momentum * momentum_bonus)
             if score > best_score:
                 best_score, best_gap = score, (s, e)
 
         return best_gap
 
-    def find_best_point(self, start_i, end_i, ranges):
+    def find_best_point(self, start_i, end_i, ranges, preferred_idx=None):
         """Return index of best target within the gap.
-        Strategy: blend deepest point (for stability) with spatial center (for safety margin).
+        Blends deepest point, spatial center, and steering momentum.
         """
         gap = ranges[start_i:end_i]
         if len(gap) == 0:
             return start_i
 
+        straight_ahead = len(ranges) // 2
+        if preferred_idx is None:
+            preferred_idx = straight_ahead
+
         max_dist    = np.max(gap)
         deep_local  = np.where(gap >= max_dist - 0.1)[0]
         deep_global = start_i + deep_local
 
-        # Among deep points, pick the one closest to straight ahead
-        straight_ahead = len(ranges) // 2
-        best_deep      = deep_global[np.argmin(np.abs(deep_global - straight_ahead))]
-
-        # Spatial center of the gap (furthest from both walls)
+        best_deep      = deep_global[np.argmin(np.abs(deep_global - preferred_idx))]
         spatial_center = start_i + len(gap) // 2
 
-        # 70% deep (stability) + 30% center (safety margin from walls)
-        return int(0.7 * best_deep + 0.3 * spatial_center)
+        return int(0.5 * best_deep + 0.2 * spatial_center + 0.3 * np.clip(preferred_idx, start_i, end_i - 1))
 
     def _index_to_xy(self, index, range_val, angle_min, angle_increment):
         """Laser frame: angle 0 = forward (+x), left = +y."""
@@ -222,8 +229,11 @@ class ReactiveFollowGap(Node):
             proc[max(0, closest_idx - bw) : min(len(proc), closest_idx + bw)] = 0.0
 
         # ── 4. Find Gap & Best Point ──────────────────────────────────────
-        start_i, end_i = self.find_max_gap(proc)
-        best_idx       = self.find_best_point(start_i, end_i, proc) + fov_min_idx
+        steer_offset   = int(self.prev_steering_angle / angle_increment)
+        preferred_idx  = len(proc) // 2 + steer_offset
+        preferred_idx  = max(0, min(len(proc) - 1, preferred_idx))
+        start_i, end_i = self.find_max_gap(proc, preferred_idx)
+        best_idx       = self.find_best_point(start_i, end_i, proc, preferred_idx) + fov_min_idx
 
         # ── 4b. Visualization: scan before (smoothed only) and after (disparity + bubble), gap/best point
         full_before = np.array(ranges, dtype=float)
@@ -259,6 +269,17 @@ class ReactiveFollowGap(Node):
         self.prev_steering_angle = self.alpha * limited + (1.0 - self.alpha) * self.prev_steering_angle
         steering_angle = self.prev_steering_angle
 
+        # ── 7b. Side-Clearance Gate ─────────────────────────────────────
+        left_s, left_e   = self.sector_indices(angle_min, angle_increment, n, np.radians(80), np.radians(100))
+        right_s, right_e = self.sector_indices(angle_min, angle_increment, n, -np.radians(100), -np.radians(80))
+        left_dist  = float(np.min(proc_full[left_s:left_e]))  if left_e  > left_s  else self.max_lidar_dist
+        right_dist = float(np.min(proc_full[right_s:right_e])) if right_e > right_s else self.max_lidar_dist
+
+        if steering_angle > 0 and left_dist < self.side_clearance_min:
+            steering_angle = -abs(steering_angle)
+        elif steering_angle < 0 and right_dist < self.side_clearance_min:
+            steering_angle = abs(steering_angle)
+
         # ── 8. Speed Control ──────────────────────────────────────────────
         abs_steer = abs(steering_angle)
         if abs_steer < np.radians(10):
@@ -275,6 +296,7 @@ class ReactiveFollowGap(Node):
             f"gap=[{start_i},{end_i}](w={end_i-start_i}) | "
             f"gap_steer={np.degrees(raw_gap_steer):.1f}° | "
             f"far_balance={far_balance:+.2f}(L={far_left:.1f} R={far_right:.1f}) fwd={forward_cl:.2f}m | "
+            f"side(L={left_dist:.2f} R={right_dist:.2f}) | "
             f"final={np.degrees(steering_angle):.1f}° | "
             f"speed={speed:.2f}m/s"
         )

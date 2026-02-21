@@ -1,0 +1,34 @@
+reactive_node:
+  ros__parameters:
+    # Sliding window average over N scans
+    window_size: 5
+
+    # Disparity extender
+    disparity_threshold: 0.5     # [m] min range jump to trigger extension
+    car_width: 0.3               # [m] half-width for extension angle calc
+
+    # Safety bubble
+    bubble_distance_threshold: 0.3   # [m] only apply if closest < this
+    bubble_radius_indices: 4         # indices zeroed each side of closest
+
+    # Gap selection
+    top_n_gaps: 2                # keep top N longest gaps before scoring
+
+    # Forward bias — the key knob
+    # Gaps/points centered straight ahead get boosted by this factor.
+    # 0 = pure longest-gap, 2.0 = strongly prefer forward, 4.0 = aggressive
+    forward_weight: 5.0
+
+    # Field of view in degrees (total). Beams outside ±fov/2 are zeroed.
+    # 270 = full Hokuyo scan, 180 = forward half, 140 = good default
+    fov_deg: 270.0
+
+    # Steering
+    steering_kp: 3.0
+    steering_kd: 0.15            # (reserved for future PD)
+    max_steering: 0.4            # [rad] absolute clamp
+
+    # Speed
+    speed_straight: 2.0          # [m/s] when steering is small
+    speed_turning: 1.0           # [m/s] when steering exceeds threshold
+    steering_threshold_frac: 0.8 # fraction of max_steering to switch speeds

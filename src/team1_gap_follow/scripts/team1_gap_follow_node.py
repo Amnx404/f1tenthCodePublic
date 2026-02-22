@@ -14,7 +14,6 @@ class ReactiveFollowGap(Node):
     def __init__(self):
         super().__init__('reactive_node')
 
-        # Declare and Load Parameters
         self._declare_params()
         
         self.scan_sub = self.create_subscription(LaserScan, '/scan', self.lidar_callback, 10)
@@ -24,7 +23,9 @@ class ReactiveFollowGap(Node):
 
         # State Variables
         self.scan_history = deque(maxlen=self.get_parameter('history_size').value)
+        self.goal_history = deque(maxlen=self.get_parameter('goal_history_size').value)
         self.prev_steer = 0.0
+        self.prev_target_angle = 0.0  # Added for deadband tracking
         self.prev_time = self.get_clock().now().nanoseconds / 1e9
         
         # PID State
@@ -32,47 +33,107 @@ class ReactiveFollowGap(Node):
         self.prev_error = 0.0
 
     def _declare_params(self):
-        """Declares tunable configuration numbers."""
-        self.declare_parameter('fov_degrees', 220.0)
+        self.declare_parameter('fov_degrees', 180.0)
         self.declare_parameter('history_size', 5) 
         self.declare_parameter('max_range', 6.0)
         self.declare_parameter('car_width', 0.5)   
         self.declare_parameter('disparity_threshold', 0.3)
         self.declare_parameter('lookahead_distance', 3.0)
+        self.declare_parameter('bubble_radius', 0.5) 
+        self.declare_parameter('goal_history_size', 25) 
         
-        # Speed params
+        # New Param: Goal Cutoff (Deadband)
+        self.declare_parameter('goal_deadband_deg', 1.5) # Minimum degree change required to update goal
+        
+        # Speed Params
         self.declare_parameter('max_speed', 4.0)
         self.declare_parameter('min_speed', 1.0)
         
-        # PID Controller and Smoothing Params
+        # PID & Smoothing
         self.declare_parameter('kp', 1.0)
         self.declare_parameter('ki', 0.01)
         self.declare_parameter('kd', 0.05)
         self.declare_parameter('steer_smoothing', 0.2) 
 
-        # Side Protection Params
-        self.declare_parameter('side_safety_dist', 0.45) # Distance to trigger override
-        self.declare_parameter('side_angle_window', 30.0) # Angular window width in degrees
+        # Wall Smoothener / Side Protection Params
+        self.declare_parameter('wall_clearance', 0.9)      
+        self.declare_parameter('repulsion_gain', 1.5)      
+        self.declare_parameter('side_safety_dist', 0.45)   
+        self.declare_parameter('side_angle_window', 30.0)  
+
+    def _apply_wall_smoothener(self, smoothed_ranges, angle_min, angle_inc, n, base_steer):
+        wall_clearance = self.get_parameter('wall_clearance').value
+        repulsion_gain = self.get_parameter('repulsion_gain').value
+        side_dist = self.get_parameter('side_safety_dist').value
+        side_window = np.radians(self.get_parameter('side_angle_window').value)
+        max_rng = self.get_parameter('max_range').value
+
+        # 1. Calculate Proactive Repulsion (using 60 to 120 degree windows)
+        left_start = max(0, int((np.radians(60) - angle_min) / angle_inc))
+        left_end = min(n, int((np.radians(120) - angle_min) / angle_inc))
+        right_start = max(0, int((np.radians(-120) - angle_min) / angle_inc))
+        right_end = min(n, int((np.radians(-60) - angle_min) / angle_inc))
+
+        left_window_repulse = smoothed_ranges[left_start:left_end]
+        right_window_repulse = smoothed_ranges[right_start:right_end]
+
+        min_left_repulse = np.min(left_window_repulse) if len(left_window_repulse) > 0 else max_rng
+        min_right_repulse = np.min(right_window_repulse) if len(right_window_repulse) > 0 else max_rng
+
+        repulsion_steer = 0.0
+        status = "NONE"
+
+        if min_left_repulse < wall_clearance:
+            repulsion_steer -= repulsion_gain * (wall_clearance - min_left_repulse)
+            status = "PUSHING RIGHT"
+        if min_right_repulse < wall_clearance:
+            repulsion_steer += repulsion_gain * (wall_clearance - min_right_repulse)
+            status = "PUSHING LEFT" if status == "NONE" else "SQUEEZED"
+
+        combined_steer = base_steer + repulsion_steer
+
+        # 2. Hard Clamp Safety Check (Exactly 90 degrees left/right)
+        left_idx = int((np.pi/2.0 - angle_min) / angle_inc)
+        right_idx = int((-np.pi/2.0 - angle_min) / angle_inc)
+        window_bins = int((side_window / 2.0) / angle_inc)
+
+        left_window_clamp = smoothed_ranges[max(0, left_idx - window_bins) : min(n, left_idx + window_bins)]
+        right_window_clamp = smoothed_ranges[max(0, right_idx - window_bins) : min(n, right_idx + window_bins)]
+
+        min_left_clamp = np.min(left_window_clamp) if len(left_window_clamp) > 0 else max_rng
+        min_right_clamp = np.min(right_window_clamp) if len(right_window_clamp) > 0 else max_rng
+
+        if combined_steer > 0.0 and min_left_clamp < side_dist:
+            combined_steer = 0.0
+            status = "LEFT PROT"
+        elif combined_steer < 0.0 and min_right_clamp < side_dist:
+            combined_steer = 0.0
+            status = "RIGHT PROT"
+
+        return combined_steer, repulsion_steer, status
 
     def lidar_callback(self, data):
-        # 0. Fetch latest parameters dynamically
+        # 0. Fetch params
         fov = self.get_parameter('fov_degrees').value
         history_size = self.get_parameter('history_size').value
         max_rng = self.get_parameter('max_range').value
         car_width = self.get_parameter('car_width').value
         disp_thresh = self.get_parameter('disparity_threshold').value
         lookahead = self.get_parameter('lookahead_distance').value
+        bubble_radius = self.get_parameter('bubble_radius').value
+        goal_hist_size = self.get_parameter('goal_history_size').value
+        deadband = np.radians(self.get_parameter('goal_deadband_deg').value)
         
         kp = self.get_parameter('kp').value
         ki = self.get_parameter('ki').value
         kd = self.get_parameter('kd').value
         alpha = self.get_parameter('steer_smoothing').value
-        
-        side_dist = self.get_parameter('side_safety_dist').value
-        side_window = np.radians(self.get_parameter('side_angle_window').value)
 
+        # Dynamic queue resizing
         if self.scan_history.maxlen != history_size:
             self.scan_history = deque(maxlen=history_size)
+        if self.goal_history.maxlen != goal_hist_size:
+            self.goal_history = deque(maxlen=goal_hist_size)
 
         # 1. Preprocess & Temporal Rolling Mean
         ranges = np.array(data.ranges, dtype=float)
@@ -108,13 +169,18 @@ class ReactiveFollowGap(Node):
                 else:
                     scan[max(0, i - w + 1) : i + 1] = 0.0
 
-        # 4. Immediate Safety Bubble
+        # 4. Obstacle Bubbling
         closest = int(np.argmin(scan))
-        if scan[closest] < 0.5 and scan[closest] > 0.0:
-            bw = int(np.ceil(np.arctan2(car_width / 2.0, scan[closest]) / angle_inc))
-            scan[max(0, closest - bw): min(len(scan), closest + bw)] = 0.0
+        closest_dist = scan[closest]
+        if closest_dist > 0.0:
+            ratio = bubble_radius / closest_dist
+            if ratio >= 1.0:
+                bw = len(scan) 
+            else:
+                bw = int(np.ceil(np.arcsin(ratio) / angle_inc))
+            scan[max(0, closest - bw): min(len(scan), closest + bw + 1)] = 0.0
 
-        # 5. Find Contiguous Gaps & Select Goal
+        # 5. Find Gaps & Goal
         mask = scan > 0.1
         gaps = []
         start = None
@@ -136,57 +202,49 @@ class ReactiveFollowGap(Node):
             goal = len(scan) // 2
             best_gap = (goal, goal + 1)
 
-        # 6. Lookahead Distance & Target Angle
-        target_distance = min(scan[goal], lookahead)
+        # 6. Cartesian Goal Smoothing
+        raw_target_dist = min(scan[goal], lookahead)
         global_idx = goal + lo
-        target_angle = angle_min + global_idx * angle_inc
+        raw_target_angle = angle_min + global_idx * angle_inc
 
-        # 7. PID Controller for Steering
+        raw_x = raw_target_dist * np.cos(raw_target_angle)
+        raw_y = raw_target_dist * np.sin(raw_target_angle)
+        self.goal_history.append((raw_x, raw_y))
+
+        avg_x = float(np.mean([p[0] for p in self.goal_history]))
+        avg_y = float(np.mean([p[1] for p in self.goal_history]))
+        smoothed_target_angle = float(np.arctan2(avg_y, avg_x))
+
+        # --- GOAL CUTOFF (DEADBAND) ---
+        # Only update the target angle if it exceeds the deadband threshold
+        if abs(smoothed_target_angle - self.prev_target_angle) > deadband:
+            self.prev_target_angle = smoothed_target_angle
+        else:
+            smoothed_target_angle = self.prev_target_angle
+        # ------------------------------
+
+        # 7. PID Controller for base steering
         current_time = self.get_clock().now().nanoseconds / 1e9
         dt = current_time - self.prev_time
         if dt <= 0.0: dt = 0.01
         
-        error = target_angle
+        error = smoothed_target_angle
         self.integral_error += error * dt
         derivative = (error - self.prev_error) / dt
         
         pid_steer = (kp * error) + (ki * self.integral_error) + (kd * derivative)
-        
         self.prev_error = error
         self.prev_time = current_time
 
-        steering_angle = alpha * pid_steer + (1.0 - alpha) * self.prev_steer
+        # 8. WALL SMOOTHENER (Repulsion + Clamps)
+        target_steer, repulsion_val, protection_status = self._apply_wall_smoothener(
+            smoothed_ranges, angle_min, angle_inc, n, pid_steer
+        )
+
+        # Apply EMA Filter for mechanical smoothness
+        steering_angle = alpha * target_steer + (1.0 - alpha) * self.prev_steer
         steering_angle = np.clip(steering_angle, -0.4, 0.4)
-
-        # ---------------------------------------------------------
-        # 8. SIDE STEERING PROTECTION
-        # ---------------------------------------------------------
-        # Calculate indices for exactly left (+90 deg) and right (-90 deg)
-        left_idx = int((np.pi/2.0 - angle_min) / angle_inc)
-        right_idx = int((-np.pi/2.0 - angle_min) / angle_inc)
-        window_bins = int((side_window / 2.0) / angle_inc)
-
-        # Safely extract side windows from the fully smoothed ranges
-        left_window = smoothed_ranges[max(0, left_idx - window_bins) : min(n, left_idx + window_bins)]
-        right_window = smoothed_ranges[max(0, right_idx - window_bins) : min(n, right_idx + window_bins)]
-
-        min_left = np.min(left_window) if len(left_window) > 0 else max_rng
-        min_right = np.min(right_window) if len(right_window) > 0 else max_rng
-
-        protection_active = "NONE"
-
-        # If PID wants to turn left, but left side is blocked
-        if steering_angle > 0.0 and min_left < side_dist:
-            steering_angle = 0.0  # Clamp to straight
-            protection_active = "LEFT PROT"
-            
-        # If PID wants to turn right, but right side is blocked
-        elif steering_angle < 0.0 and min_right < side_dist:
-            steering_angle = 0.0  # Clamp to straight
-            protection_active = "RIGHT PROT"
-
         self.prev_steer = steering_angle
-        # ---------------------------------------------------------
 
         # 9. Speed Control
         max_spd = self.get_parameter('max_speed').value
@@ -201,7 +259,7 @@ class ReactiveFollowGap(Node):
             t = (abs_steer - np.radians(10)) / np.radians(10)
             speed = max_spd - t * (max_spd - min_spd)
 
-        # 10. Publish drive
+        # 10. Publish
         msg = AckermannDriveStamped()
         msg.drive.speed = float(speed)
         msg.drive.steering_angle = float(steering_angle)
@@ -211,7 +269,12 @@ class ReactiveFollowGap(Node):
         full = np.array(ranges, dtype=float)
         full[lo:hi] = scan
         self.viz_scan_pub.publish(self._make_scan(data, full))
-        self._publish_markers(data, scan, lo, best_gap, goal, target_distance, steering_angle, target_angle, speed, protection_active)
+        
+        self._publish_markers(
+            data, scan, lo, best_gap, 
+            raw_x, raw_y, avg_x, avg_y, 
+            steering_angle, repulsion_val, speed, protection_status
+        )
 
     # ── Viz helpers ──────────────────────────────────────────────────────
 
@@ -229,7 +292,7 @@ class ReactiveFollowGap(Node):
         msg.ranges = [float(r) for r in ranges_full]
         return msg
 
-    def _publish_markers(self, data, scan, lo, gap, goal_idx, target_dist, steer, target_angle, speed, protection_status):
+    def _publish_markers(self, data, scan, lo, gap, rx, ry, sx, sy, steer, repulse, speed, protection_status):
         a_min = data.angle_min
         a_inc = data.angle_increment
         stamp = self.get_clock().now().to_msg()
@@ -243,9 +306,6 @@ class ReactiveFollowGap(Node):
         last = max(gs, ge - 1)
         x0, y0 = to_xy(lo + gs, float(scan[gs]) if gs < len(scan) else 0.0)
         x1, y1 = to_xy(lo + last, float(scan[last]) if last < len(scan) else 0.0)
-        
-        xg = float(target_dist * np.cos(target_angle))
-        yg = float(target_dist * np.sin(target_angle))
 
         ma = MarkerArray()
 
@@ -261,39 +321,75 @@ class ReactiveFollowGap(Node):
         m.points = [Point(x=x0, y=y0, z=0.0), Point(x=x1, y=y1, z=0.0)]
         ma.markers.append(m)
 
-        # 2. Target Sphere
+        # 2. Raw Target Sphere
         m = Marker()
         m.header.frame_id = fid
         m.header.stamp = stamp
-        m.ns, m.id = 'goal', 0
+        m.ns, m.id = 'raw_goal', 0
         m.type = Marker.SPHERE
         m.action = Marker.ADD
-        m.pose.position.x, m.pose.position.y = xg, yg
+        m.pose.position.x, m.pose.position.y = float(rx), float(ry)
+        m.pose.orientation.w = 1.0
+        m.scale.x = m.scale.y = m.scale.z = 0.2
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.0, 1.0, 1.0, 0.7
+        ma.markers.append(m)
+
+        # 3. Smoothed Target Sphere
+        m = Marker()
+        m.header.frame_id = fid
+        m.header.stamp = stamp
+        m.ns, m.id = 'smooth_goal', 0
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position.x, m.pose.position.y = float(sx), float(sy)
         m.pose.orientation.w = 1.0
         m.scale.x = m.scale.y = m.scale.z = 0.4
         m.color.r, m.color.a = 1.0, 1.0
         ma.markers.append(m)
 
-        # 3. Steering Arrow
+        # 4. Final Steering Arrow
         sl = 2.0
-        sx, sy = sl * np.cos(steer), sl * np.sin(steer)
+        arr_x, arr_y = sl * np.cos(steer), sl * np.sin(steer)
         m = Marker()
         m.header.frame_id = fid
         m.header.stamp = stamp
         m.ns, m.id = 'steer', 0
         m.type = Marker.ARROW
         m.action = Marker.ADD
-        m.points = [Point(x=0.0, y=0.0, z=0.05), Point(x=sx, y=sy, z=0.05)]
+        m.points = [Point(x=0.0, y=0.0, z=0.05), Point(x=arr_x, y=arr_y, z=0.05)]
         m.scale.x, m.scale.y = 0.1, 0.15
         
-        # Color arrow RED if protection is overriding it, YELLOW if normal
-        if protection_status != "NONE":
+        if "PROT" in protection_status:
             m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.0, 0.0, 1.0 
         else:
             m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.85, 0.0, 1.0
         ma.markers.append(m)
 
-        # 4. Text HUD
+        # 5. Repulsion Force Arrow
+        if abs(repulse) > 0.01:
+            rl = 2.0 * abs(repulse) * 2.0 
+            rep_angle = np.pi/2.0 if repulse > 0 else -np.pi/2.0
+            rx_force, ry_force = rl * np.cos(rep_angle), rl * np.sin(rep_angle)
+            
+            m = Marker()
+            m.header.frame_id = fid
+            m.header.stamp = stamp
+            m.ns, m.id = 'repulsion_force', 0
+            m.type = Marker.ARROW
+            m.action = Marker.ADD
+            m.points = [Point(x=0.0, y=0.0, z=0.1), Point(x=rx_force, y=ry_force, z=0.1)]
+            m.scale.x, m.scale.y = 0.15, 0.2
+            m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.0, 1.0, 1.0
+            ma.markers.append(m)
+        else:
+            m = Marker()
+            m.header.frame_id = fid
+            m.header.stamp = stamp
+            m.ns, m.id = 'repulsion_force', 0
+            m.action = Marker.DELETE
+            ma.markers.append(m)
+
+        # 6. Text HUD
         m = Marker()
         m.header.frame_id = fid
         m.header.stamp = stamp
@@ -305,8 +401,8 @@ class ReactiveFollowGap(Node):
         m.scale.z = 0.25
         
         if protection_status != "NONE":
-            m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.2, 0.2, 1.0
-            hud_text = f'Spd: {speed:.1f} m/s | Steer: {np.degrees(steer):.0f} deg\n[ {protection_status} ACTIVE ]'
+            m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 0.2, 1.0, 1.0
+            hud_text = f'Spd: {speed:.1f} m/s | Steer: {np.degrees(steer):.0f} deg\n[ {protection_status} ]'
         else:
             m.color.r = m.color.g = m.color.b = m.color.a = 1.0
             hud_text = f'Spd: {speed:.1f} m/s | Steer: {np.degrees(steer):.0f} deg'

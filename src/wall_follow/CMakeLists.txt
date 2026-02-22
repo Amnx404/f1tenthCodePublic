@@ -26,20 +26,6 @@ foreach(PACKAGE
 
 endforeach()
 
-# Include Cpp "include" directory
-include_directories(include)
-
-# Create Cpp executable
-add_executable(wall_follow_node src/wall_follow_node.cpp)
-ament_target_dependencies(wall_follow_node 
-  rclcpp geometry_msgs ackermann_msgs nav_msgs sensor_msgs std_msgs
-)
-
-# Install Cpp executables
-install(TARGETS
-  wall_follow_node
-  DESTINATION lib/${PROJECT_NAME})
-
 # Install Python modules
 ament_python_install_package(${PROJECT_NAME})
 

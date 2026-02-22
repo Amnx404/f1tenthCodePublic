@@ -1,10 +1,8 @@
 cmake_minimum_required(VERSION 3.5)
 project(team1_gap_follow)
 
-# Default to C++14
-if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
-endif()
+# C++17 (code uses structured bindings and pair return)
+set(CMAKE_CXX_STANDARD 17)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -17,6 +15,7 @@ foreach(PACKAGE
   rclcpp
   rclpy 
   geometry_msgs
+  visualization_msgs
   nav_msgs
   ackermann_msgs
   sensor_msgs
@@ -32,13 +31,23 @@ include_directories(include)
 # Create Cpp executable
 add_executable(team1_gap_follow_cpp src/reactive_node.cpp)
 ament_target_dependencies(team1_gap_follow_cpp
-  rclcpp geometry_msgs ackermann_msgs nav_msgs sensor_msgs std_msgs
+  rclcpp geometry_msgs visualization_msgs ackermann_msgs nav_msgs sensor_msgs std_msgs
 )
 
 # Install Cpp executables
 install(TARGETS
   team1_gap_follow_cpp
   DESTINATION lib/${PROJECT_NAME})
+
+# Install config
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
+)
+
+# Install launch
+install(DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+)
 
 # Install Python modules
 ament_python_install_package(${PROJECT_NAME})

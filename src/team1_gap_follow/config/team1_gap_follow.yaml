@@ -1,0 +1,41 @@
+# team1_gap_follow C++ node parameters (node name in code: reactive_node)
+# Best: ros2 launch team1_gap_follow cpp.launch.py
+
+reactive_node:
+  ros__parameters:
+    # Field of view (degrees) for gap finding
+    fov_degrees: 220.0
+    # Smoothing history size
+    history_size: 3
+    # Max LiDAR range (m)
+    max_range: 4.0
+    # Car width (m) for disparity extension
+    car_width: 0.35
+    # Min distance jump to trigger disparity extension (m)
+    disparity_threshold: 0.2
+    # Lookahead distance (m)
+    lookahead_distance: 1.5
+    # Safety bubble radius (m) around closest point
+    bubble_radius: 0.4
+    # Aim window (degrees) for target selection
+    aim_window_degrees: 180.0
+    # Goal angle smoothing (0=slow, 1=fast)
+    goal_smoothing_alpha: 0.3
+    # Goal deadband (degrees) - ignore small corrections
+    goal_deadband_deg: 3.0
+    # Speed limits (m/s)
+    max_speed: 3.0
+    min_speed: 0.9
+    # PID for steering
+    kp: 0.9
+    ki: 0.003
+    kd: 0.2
+    # Steering output smoothing (0=slow, 1=fast)
+    steer_smoothing: 0.3
+    # Wall repulsion
+    wall_clearance: 0.4
+    repulsion_gain: 1.9
+    side_safety_dist: 0.2
+    side_angle_window: 10.0
+    # PID integral windup clamp
+    integral_clamp: 3.0

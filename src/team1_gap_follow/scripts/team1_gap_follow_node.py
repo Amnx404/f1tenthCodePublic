@@ -23,43 +23,49 @@ class ReactiveFollowGap(Node):
 
         # State Variables
         self.scan_history = deque(maxlen=self.get_parameter('history_size').value)
-        self.goal_history = deque(maxlen=self.get_parameter('goal_history_size').value)
+        self.smoothed_goal_x = None  
+        self.smoothed_goal_y = None  
+        
         self.prev_steer = 0.0
-        self.prev_target_angle = 0.0  # Added for deadband tracking
+        self.prev_target_angle = 0.0  
         self.prev_time = self.get_clock().now().nanoseconds / 1e9
         
-        # PID State
-        self.integral_error = 0.0
+        # PID State (integral is time-windowed via integral_history)
+        self.integral_history = deque()  # (timestamp, error*dt) for windowed integral
         self.prev_error = 0.0
+        # Input-to-output latency logging (throttle to ~1 Hz)
+        self._last_latency_log_time = 0.0
 
     def _declare_params(self):
-        self.declare_parameter('fov_degrees', 180.0)
+        self.declare_parameter('fov_degrees', 220.0)
         self.declare_parameter('history_size', 5) 
-        self.declare_parameter('max_range', 6.0)
-        self.declare_parameter('car_width', 0.5)   
-        self.declare_parameter('disparity_threshold', 0.3)
-        self.declare_parameter('lookahead_distance', 3.0)
-        self.declare_parameter('bubble_radius', 0.5) 
-        self.declare_parameter('goal_history_size', 25) 
+        self.declare_parameter('max_range', 4.0)
+        self.declare_parameter('car_width', 0.35)   
+        self.declare_parameter('disparity_threshold', 0.2)
+        self.declare_parameter('lookahead_distance', 2) 
+        self.declare_parameter('bubble_radius', 0.4) 
         
-        # New Param: Goal Cutoff (Deadband)
-        self.declare_parameter('goal_deadband_deg', 1.5) # Minimum degree change required to update goal
+        # NEW: Fixed Targeting Window to prevent "Rearview Mirror" effect
+        self.declare_parameter('aim_window_degrees', 190.0) 
         
-        # Speed Params
-        self.declare_parameter('max_speed', 4.0)
-        self.declare_parameter('min_speed', 1.0)
+        self.declare_parameter('goal_smoothing_alpha', 0.6) 
+        self.declare_parameter('goal_deadband_deg', 2.0) 
         
-        # PID & Smoothing
-        self.declare_parameter('kp', 1.0)
-        self.declare_parameter('ki', 0.01)
-        self.declare_parameter('kd', 0.05)
-        self.declare_parameter('steer_smoothing', 0.2) 
+        self.declare_parameter('max_speed', 2)
+        self.declare_parameter('min_speed', 1)
+        
+        self.declare_parameter('kp', 0.9)
+        self.declare_parameter('ki', 0.001)
+        self.declare_parameter('kd', 0.3)
+        self.declare_parameter('steer_smoothing', 0.3) 
 
-        # Wall Smoothener / Side Protection Params
-        self.declare_parameter('wall_clearance', 0.9)      
-        self.declare_parameter('repulsion_gain', 1.5)      
-        self.declare_parameter('side_safety_dist', 0.45)   
-        self.declare_parameter('side_angle_window', 30.0)  
+        self.declare_parameter('wall_clearance', 0.4)      
+        self.declare_parameter('repulsion_gain', 1.9)      
+        self.declare_parameter('side_safety_dist', 0.2)   
+        self.declare_parameter('side_angle_window', 15.0)
+        # Integral: time window (only sum errors over last N sec) and windup clamp
+        self.declare_parameter('integral_window_sec', 2.0)
+        self.declare_parameter('integral_clamp', 1.0)
 
     def _apply_wall_smoothener(self, smoothed_ranges, angle_min, angle_inc, n, base_steer):
         wall_clearance = self.get_parameter('wall_clearance').value
@@ -68,7 +74,7 @@ class ReactiveFollowGap(Node):
         side_window = np.radians(self.get_parameter('side_angle_window').value)
         max_rng = self.get_parameter('max_range').value
 
-        # 1. Calculate Proactive Repulsion (using 60 to 120 degree windows)
+        # 1. Proactive Repulsion
         left_start = max(0, int((np.radians(60) - angle_min) / angle_inc))
         left_end = min(n, int((np.radians(120) - angle_min) / angle_inc))
         right_start = max(0, int((np.radians(-120) - angle_min) / angle_inc))
@@ -92,7 +98,7 @@ class ReactiveFollowGap(Node):
 
         combined_steer = base_steer + repulsion_steer
 
-        # 2. Hard Clamp Safety Check (Exactly 90 degrees left/right)
+        # 2. Hard Clamp Safety Check
         left_idx = int((np.pi/2.0 - angle_min) / angle_inc)
         right_idx = int((-np.pi/2.0 - angle_min) / angle_inc)
         window_bins = int((side_window / 2.0) / angle_inc)
@@ -113,7 +119,7 @@ class ReactiveFollowGap(Node):
         return combined_steer, repulsion_steer, status
 
     def lidar_callback(self, data):
-        # 0. Fetch params
+        t_start = self.get_clock().now().nanoseconds / 1e9
         fov = self.get_parameter('fov_degrees').value
         history_size = self.get_parameter('history_size').value
         max_rng = self.get_parameter('max_range').value
@@ -121,22 +127,21 @@ class ReactiveFollowGap(Node):
         disp_thresh = self.get_parameter('disparity_threshold').value
         lookahead = self.get_parameter('lookahead_distance').value
         bubble_radius = self.get_parameter('bubble_radius').value
-        goal_hist_size = self.get_parameter('goal_history_size').value
+        
+        aim_window = self.get_parameter('aim_window_degrees').value
+        goal_alpha = self.get_parameter('goal_smoothing_alpha').value
         deadband = np.radians(self.get_parameter('goal_deadband_deg').value)
         
         kp = self.get_parameter('kp').value
         ki = self.get_parameter('ki').value
         kd = self.get_parameter('kd').value
-        alpha = self.get_parameter('steer_smoothing').value
+        steer_alpha = self.get_parameter('steer_smoothing').value
 
-        # Dynamic queue resizing
         if self.scan_history.maxlen != history_size:
             self.scan_history = deque(maxlen=history_size)
-        if self.goal_history.maxlen != goal_hist_size:
-            self.goal_history = deque(maxlen=goal_hist_size)
 
         # 1. Preprocess & Temporal Rolling Mean
-        ranges = np.array(data.ranges, dtype=float)
+        ranges = np.array(data.ranges, dtype=np.float32)
         ranges = np.nan_to_num(ranges, posinf=max_rng, nan=0.0)
         ranges = np.clip(ranges, 0.0, max_rng)
         
@@ -154,95 +159,116 @@ class ReactiveFollowGap(Node):
         hi = min(n, center + half)
         scan = smoothed_ranges[lo:hi].copy()
 
-        # 3. Disparity Extender
-        for i in range(len(scan) - 1):
-            diff = scan[i + 1] - scan[i]
-            if abs(diff) > disp_thresh:
-                closer = min(scan[i], scan[i + 1])
-                if closer < 0.1: continue
-                
-                angle_to_cover = np.arctan2(car_width / 2.0, closer)
-                w = int(np.ceil(angle_to_cover / angle_inc))
-                
-                if diff > 0:
-                    scan[i + 1 : min(len(scan), i + 1 + w)] = 0.0
-                else:
-                    scan[max(0, i - w + 1) : i + 1] = 0.0
+        # 3. HIGH-SPEED Vectorized Disparity Extender
+        diffs = np.diff(scan)
+        jumps = np.where(np.abs(diffs) > disp_thresh)[0]
+        
+        for i in jumps:
+            closer = min(scan[i], scan[i + 1])
+            if closer < 0.1: continue
+            w = int(np.ceil(np.arctan2(car_width / 2.0, closer) / angle_inc))
+            
+            if diffs[i] > 0:
+                scan[i + 1 : min(len(scan), i + 1 + w)] = 0.0
+            else:
+                scan[max(0, i - w + 1) : i + 1] = 0.0
 
         # 4. Obstacle Bubbling
         closest = int(np.argmin(scan))
         closest_dist = scan[closest]
         if closest_dist > 0.0:
             ratio = bubble_radius / closest_dist
-            if ratio >= 1.0:
-                bw = len(scan) 
-            else:
-                bw = int(np.ceil(np.arcsin(ratio) / angle_inc))
+            bw = len(scan) if ratio >= 1.0 else int(np.ceil(np.arcsin(ratio) / angle_inc))
             scan[max(0, closest - bw): min(len(scan), closest + bw + 1)] = 0.0
 
-        # 5. Find Gaps & Goal
+        # 5. Gap Finding with FIXED AIM WINDOW
         mask = scan > 0.1
-        gaps = []
-        start = None
-        for i, val in enumerate(mask):
-            if val and start is None:
-                start = i
-            elif not val and start is not None:
-                gaps.append((start, i))
-                start = None
-        if start is not None:
-            gaps.append((start, len(mask)))
+        padded_mask = np.concatenate(([False], mask, [False]))
+        diffs_mask = np.diff(padded_mask.astype(int))
+        
+        starts = np.where(diffs_mask == 1)[0]
+        ends = np.where(diffs_mask == -1)[0]
+        
+        # Create a mask that is only 1.0 inside the aiming window
+        aim_half = int(np.radians(aim_window) / 2.0 / angle_inc)
+        aim_start = max(0, len(scan) // 2 - aim_half)
+        aim_end = min(len(scan), len(scan) // 2 + aim_half)
+        
+        aim_mask = np.zeros(len(scan), dtype=np.float32)
+        aim_mask[aim_start:aim_end] = 1.0
 
-        if gaps:
-            best_gap = max(gaps, key=lambda g: float(np.max(scan[g[0]:g[1]])))
-            gap_scan = scan[best_gap[0]:best_gap[1]]
-            local_goal_idx = np.argmax(gap_scan)
-            goal = best_gap[0] + local_goal_idx
+        if len(starts) > 0:
+            max_ranges = []
+            for s, e in zip(starts, ends):
+                # Zeros out depth values outside the aim window to prevent looking backward
+                gap_vals = scan[s:e] * aim_mask[s:e]
+                max_ranges.append(np.max(gap_vals) if len(gap_vals) > 0 else 0.0)
+                
+            best_idx = np.argmax(max_ranges)
+            best_gap = (starts[best_idx], ends[best_idx])
+            
+            # Deepest Point (Restricted strictly to the aim window)
+            gap_aim_scan = scan[best_gap[0]:best_gap[1]] * aim_mask[best_gap[0]:best_gap[1]]
+            deepest_idx = best_gap[0] + np.argmax(gap_aim_scan)
         else:
-            goal = len(scan) // 2
-            best_gap = (goal, goal + 1)
+            best_gap = (len(scan)//2, len(scan)//2 + 1)
+            deepest_idx = len(scan) // 2
 
-        # 6. Cartesian Goal Smoothing
-        raw_target_dist = min(scan[goal], lookahead)
-        global_idx = goal + lo
-        raw_target_angle = angle_min + global_idx * angle_inc
+        # Convert the restricted deepest point to XY coordinates (Cyan Sphere)
+        deep_dist = min(scan[deepest_idx], lookahead)
+        deep_angle = angle_min + (deepest_idx + lo) * angle_inc
+        deep_x = deep_dist * np.cos(deep_angle)
+        deep_y = deep_dist * np.sin(deep_angle)
 
-        raw_x = raw_target_dist * np.cos(raw_target_angle)
-        raw_y = raw_target_dist * np.sin(raw_target_angle)
-        self.goal_history.append((raw_x, raw_y))
+        # -------------------------------------------------------------
+        # 6. CARTESIAN EMA GOAL FILTERING 
+        # (The Red Sphere now correctly chases the Cyan Sphere!)
+        # -------------------------------------------------------------
+        if self.smoothed_goal_x is None:
+            self.smoothed_goal_x = deep_x
+            self.smoothed_goal_y = deep_y
+        else:
+            self.smoothed_goal_x = (goal_alpha * deep_x) + ((1.0 - goal_alpha) * self.smoothed_goal_x)
+            self.smoothed_goal_y = (goal_alpha * deep_y) + ((1.0 - goal_alpha) * self.smoothed_goal_y)
 
-        avg_x = float(np.mean([p[0] for p in self.goal_history]))
-        avg_y = float(np.mean([p[1] for p in self.goal_history]))
-        smoothed_target_angle = float(np.arctan2(avg_y, avg_x))
+        smoothed_target_angle = float(np.arctan2(self.smoothed_goal_y, self.smoothed_goal_x))
+        # -------------------------------------------------------------
 
         # --- GOAL CUTOFF (DEADBAND) ---
-        # Only update the target angle if it exceeds the deadband threshold
         if abs(smoothed_target_angle - self.prev_target_angle) > deadband:
             self.prev_target_angle = smoothed_target_angle
         else:
             smoothed_target_angle = self.prev_target_angle
-        # ------------------------------
 
-        # 7. PID Controller for base steering
+        # 7. PID Controller (time-windowed integral + clamp)
         current_time = self.get_clock().now().nanoseconds / 1e9
         dt = current_time - self.prev_time
-        if dt <= 0.0: dt = 0.01
-        
+        if dt <= 0.0:
+            dt = 0.01
+
         error = smoothed_target_angle
-        self.integral_error += error * dt
+        integral_window_sec = self.get_parameter('integral_window_sec').value
+        integral_clamp = self.get_parameter('integral_clamp').value
+
+        # Time-based integral window: keep only (t, error*dt) within last integral_window_sec
+        self.integral_history.append((current_time, error * dt))
+        cutoff = current_time - integral_window_sec
+        while self.integral_history and self.integral_history[0][0] < cutoff:
+            self.integral_history.popleft()
+        integral_error = sum(delta for _, delta in self.integral_history)
+        integral_error = np.clip(integral_error, -integral_clamp, integral_clamp)
+
         derivative = (error - self.prev_error) / dt
-        
-        pid_steer = (kp * error) + (ki * self.integral_error) + (kd * derivative)
+        pid_steer = (kp * error) + (ki * integral_error) + (kd * derivative)
         self.prev_error = error
         self.prev_time = current_time
 
-        # 8. WALL SMOOTHENER (Repulsion + Clamps)
+        # 8. WALL SMOOTHENER
         target_steer, repulsion_val, protection_status = self._apply_wall_smoothener(
             smoothed_ranges, angle_min, angle_inc, n, pid_steer
         )
 
-        # Apply EMA Filter for mechanical smoothness
-        steering_angle = alpha * target_steer + (1.0 - alpha) * self.prev_steer
+        steering_angle = steer_alpha * target_steer + (1.0 - steer_alpha) * self.prev_steer
         steering_angle = np.clip(steering_angle, -0.4, 0.4)
         self.prev_steer = steering_angle
 
@@ -265,14 +291,21 @@ class ReactiveFollowGap(Node):
         msg.drive.steering_angle = float(steering_angle)
         self.drive_pub.publish(msg)
 
-        # 11. Visualization updates
-        full = np.array(ranges, dtype=float)
+        # Input-to-output latency (throttled to ~1 Hz)
+        t_end = self.get_clock().now().nanoseconds / 1e9
+        latency_ms = (t_end - t_start) * 1000.0
+        if t_end - self._last_latency_log_time >= 1.0:
+            self.get_logger().info(f'input→output latency: {latency_ms:.2f} ms')
+            self._last_latency_log_time = t_end
+
+        # 11. Visualization
+        full = np.array(ranges, dtype=np.float32)
         full[lo:hi] = scan
         self.viz_scan_pub.publish(self._make_scan(data, full))
         
         self._publish_markers(
             data, scan, lo, best_gap, 
-            raw_x, raw_y, avg_x, avg_y, 
+            self.smoothed_goal_x, self.smoothed_goal_y, deep_x, deep_y, 
             steering_angle, repulsion_val, speed, protection_status
         )
 
@@ -289,10 +322,10 @@ class ReactiveFollowGap(Node):
         msg.scan_time = data.scan_time
         msg.range_min = data.range_min
         msg.range_max = data.range_max
-        msg.ranges = [float(r) for r in ranges_full]
+        msg.ranges = ranges_full.tolist() 
         return msg
 
-    def _publish_markers(self, data, scan, lo, gap, rx, ry, sx, sy, steer, repulse, speed, protection_status):
+    def _publish_markers(self, data, scan, lo, gap, sx, sy, dx, dy, steer, repulse, speed, protection_status):
         a_min = data.angle_min
         a_inc = data.angle_increment
         stamp = self.get_clock().now().to_msg()
@@ -303,38 +336,40 @@ class ReactiveFollowGap(Node):
             return float(r * np.cos(a)), float(r * np.sin(a))
 
         gs, ge = gap
-        last = max(gs, ge - 1)
-        x0, y0 = to_xy(lo + gs, float(scan[gs]) if gs < len(scan) else 0.0)
-        x1, y1 = to_xy(lo + last, float(scan[last]) if last < len(scan) else 0.0)
-
         ma = MarkerArray()
 
-        # 1. Gap line
+        # 1. ACTUAL CONTOUR GAP VISUALIZATION
         m = Marker()
         m.header.frame_id = fid
         m.header.stamp = stamp
         m.ns, m.id = 'gap', 0
         m.type = Marker.LINE_STRIP
         m.action = Marker.ADD
-        m.scale.x = 0.1
+        m.scale.x = 0.08
         m.color.g, m.color.a = 1.0, 1.0
-        m.points = [Point(x=x0, y=y0, z=0.0), Point(x=x1, y=y1, z=0.0)]
+        
+        contour_points = []
+        for i in range(gs, ge):
+            if scan[i] > 0.1:
+                px, py = to_xy(lo + i, float(scan[i]))
+                contour_points.append(Point(x=px, y=py, z=0.0))
+        m.points = contour_points
         ma.markers.append(m)
 
-        # 2. Raw Target Sphere
+        # 2. Deepest Point inside Aim Window (Cyan Sphere)
         m = Marker()
         m.header.frame_id = fid
         m.header.stamp = stamp
-        m.ns, m.id = 'raw_goal', 0
+        m.ns, m.id = 'deepest_point', 0
         m.type = Marker.SPHERE
         m.action = Marker.ADD
-        m.pose.position.x, m.pose.position.y = float(rx), float(ry)
+        m.pose.position.x, m.pose.position.y = float(dx), float(dy)
         m.pose.orientation.w = 1.0
-        m.scale.x = m.scale.y = m.scale.z = 0.2
+        m.scale.x = m.scale.y = m.scale.z = 0.25
         m.color.r, m.color.g, m.color.b, m.color.a = 0.0, 1.0, 1.0, 0.7
         ma.markers.append(m)
 
-        # 3. Smoothed Target Sphere
+        # 3. EMA Filtered Target Goal (Red Sphere) - Now chases the Cyan Sphere!
         m = Marker()
         m.header.frame_id = fid
         m.header.stamp = stamp

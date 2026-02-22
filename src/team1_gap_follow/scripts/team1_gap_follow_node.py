@@ -38,31 +38,33 @@ class ReactiveFollowGap(Node):
 
     def _declare_params(self):
         self.declare_parameter('fov_degrees', 220.0)
-        self.declare_parameter('history_size', 5) 
+        self.declare_parameter('history_size', 3) 
         self.declare_parameter('max_range', 4.0)
         self.declare_parameter('car_width', 0.35)   
-        self.declare_parameter('disparity_threshold', 0.2)
-        self.declare_parameter('lookahead_distance', 2) 
-        self.declare_parameter('bubble_radius', 0.4) 
+        self.declare_parameter('disparity_threshold', 0.3)
+        self.declare_parameter('lookahead_distance', 4)
+        self.declare_parameter('min_lookahead', 0.8)
+        self.declare_parameter('bubble_radius', 0.25) 
         
         # NEW: Fixed Targeting Window to prevent "Rearview Mirror" effect
-        self.declare_parameter('aim_window_degrees', 190.0) 
+        self.declare_parameter('aim_window_degrees', 160.0) 
         
-        self.declare_parameter('goal_smoothing_alpha', 0.6) 
-        self.declare_parameter('goal_deadband_deg', 2.0) 
+        self.declare_parameter('goal_smoothing_alpha', 0.5) 
+        self.declare_parameter('goal_deadband_deg', 3) 
         
-        self.declare_parameter('max_speed', 2)
-        self.declare_parameter('min_speed', 1)
+        self.declare_parameter('max_speed', 0)
+        self.declare_parameter('min_speed', 0)
         
-        self.declare_parameter('kp', 0.9)
-        self.declare_parameter('ki', 0.001)
-        self.declare_parameter('kd', 0.3)
-        self.declare_parameter('steer_smoothing', 0.3) 
+
+        self.declare_parameter('kp', 0.6)
+        self.declare_parameter('ki', 0.0003)
+        self.declare_parameter('kd', 0.15)
+        self.declare_parameter('steer_smoothing', 0.95) 
 
         self.declare_parameter('wall_clearance', 0.4)      
         self.declare_parameter('repulsion_gain', 1.9)      
-        self.declare_parameter('side_safety_dist', 0.2)   
-        self.declare_parameter('side_angle_window', 15.0)
+        self.declare_parameter('side_safety_dist', 0.14)   
+        self.declare_parameter('side_angle_window', 5.0)
         # Integral: time window (only sum errors over last N sec) and windup clamp
         self.declare_parameter('integral_window_sec', 2.0)
         self.declare_parameter('integral_clamp', 1.0)
@@ -214,8 +216,16 @@ class ReactiveFollowGap(Node):
             best_gap = (len(scan)//2, len(scan)//2 + 1)
             deepest_idx = len(scan) // 2
 
+        # Adaptive lookahead: shrinks when a wall is close ahead, expands on straights
+        min_la = self.get_parameter('min_lookahead').value
+        fwd_half = int(np.radians(20) / angle_inc)
+        fwd_center = len(scan) // 2
+        fwd_slice = scan[max(0, fwd_center - fwd_half) : min(len(scan), fwd_center + fwd_half)]
+        forward_clearance = float(np.max(fwd_slice)) if len(fwd_slice) > 0 else lookahead
+        adaptive_lookahead = float(np.clip(forward_clearance * 0.55, min_la, lookahead))
+
         # Convert the restricted deepest point to XY coordinates (Cyan Sphere)
-        deep_dist = min(scan[deepest_idx], lookahead)
+        deep_dist = min(scan[deepest_idx], adaptive_lookahead)
         deep_angle = angle_min + (deepest_idx + lo) * angle_inc
         deep_x = deep_dist * np.cos(deep_angle)
         deep_y = deep_dist * np.sin(deep_angle)

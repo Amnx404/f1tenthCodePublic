@@ -15,6 +15,7 @@
 #include "tf2_ros/buffer.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include <tf2/exceptions.h>
+#include "std_msgs/msg/float32.hpp"
 
 using std::placeholders::_1;
 
@@ -56,6 +57,8 @@ public:
         viz_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/gap_viz", 10);
         scan_before_pub_ = this->create_publisher<sensor_msgs::msg::LaserScan>("/gap_viz_scan_before", 10);
         scan_proc_pub_ = this->create_publisher<sensor_msgs::msg::LaserScan>("/gap_viz_scan_proc", 10);
+        gap_width_pub_ = this->create_publisher<std_msgs::msg::Float32>("/viz/gap_width", 10);
+        gap_depth_pub_ = this->create_publisher<std_msgs::msg::Float32>("/viz/gap_depth", 10);
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
     }
@@ -82,6 +85,8 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
     rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_before_pub_;
     rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_proc_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr gap_width_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr gap_depth_pub_;
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
@@ -363,6 +368,17 @@ private:
         if (!best) return;
 
         publish_gap_viz(scan_msg, *best);
+        
+        // --- NEW: Publish Gap Metrics for Time-Series Plotting ---
+        std_msgs::msg::Float32 depth_msg;
+        depth_msg.data = best->deepest_r;
+        gap_depth_pub_->publish(depth_msg);
+
+        std_msgs::msg::Float32 width_msg;
+        // Calculate angular width of the gap in radians
+        width_msg.data = static_cast<float>(best->end - best->start) * angle_inc;
+        gap_width_pub_->publish(width_msg);
+        // ---------------------------------------------------------
 
         // Steer toward the deepest point
         float angle = angle_min + static_cast<float>(best->deepest_i) * angle_inc;

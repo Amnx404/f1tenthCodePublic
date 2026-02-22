@@ -13,8 +13,10 @@ reactive_node:
     car_width: 0.35
     # Min distance jump to trigger disparity extension (m)
     disparity_threshold: 0.2
-    # Lookahead distance (m)
+    # Lookahead distance: max (m); actual value shrinks near corners
     lookahead_distance: 1.5
+    # Minimum lookahead when wall is very close ahead (m)
+    min_lookahead: 0.8
     # Safety bubble radius (m) around closest point
     bubble_radius: 0.4
     # Aim window (degrees) for target selection

@@ -7,7 +7,7 @@ from sensor_msgs.msg import LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped
 from visualization_msgs.msg import MarkerArray, Marker
 from geometry_msgs.msg import Point
-
+from sensor_msgs.msg import Joy  # Deadman Switch
 
 class ReactiveFollowGap(Node):
 
@@ -20,6 +20,11 @@ class ReactiveFollowGap(Node):
         self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', 10)
         self.viz_scan_pub = self.create_publisher(LaserScan, '/gap_viz_scan', 10)
         self.viz_gap_pub = self.create_publisher(MarkerArray, '/gap_viz', 10)
+        
+        # # Joy deadman switch
+        # self.joy_sub = self.create_subscription(Joy, '/joy', self.joy_callback, 10)
+        # self.deadman_engaged = False 
+        # self.declare_parameter('deadman_button', 4) # 4 is usually L1 on a PS4 controller
 
         # State Variables
         self.scan_history = deque(maxlen=self.get_parameter('history_size').value)
@@ -44,47 +49,51 @@ class ReactiveFollowGap(Node):
         self.declare_parameter('history_size', 2) 
         self.declare_parameter('max_range', 5)
         self.declare_parameter('car_width', 0.4)   
-        self.declare_parameter('disparity_threshold', 0.4)
+        self.declare_parameter('disparity_threshold', 0.5)
         self.declare_parameter('lookahead_distance', 2)
-        self.declare_parameter('min_lookahead', 0.8)
+        self.declare_parameter('min_lookahead', 0.5)
         # Ratio: adaptive_lookahead = forward_clearance * this, clamped to [min_lookahead, lookahead_distance]
-        self.declare_parameter('lookahead_ratio', 0.6)
-        self.declare_parameter('bubble_radius', 0.4) 
+        self.declare_parameter('lookahead_ratio', 0.8)
+        self.declare_parameter('bubble_radius', 0.35) 
         
         # NEW: Fixed Targeting Window to prevent "Rearview Mirror" effect
-        self.declare_parameter('aim_window_degrees', 190.0) 
+        self.declare_parameter('aim_window_degrees', 170.0) 
         
-        self.declare_parameter('goal_smoothing_alpha', 0.5) 
-        self.declare_parameter('goal_deadband_deg', 3)
-        # Blend between gap center (0) and deepest point (1); lower = wider arcs on turns
-        self.declare_parameter('gap_target_bias', 0.75)
-        # Max rate the goal angle can change (deg/s) – prevents snapping into turns too early
-        self.declare_parameter('max_goal_rate_deg_s', 360.0)
+        self.declare_parameter('goal_smoothing_alpha', 0.95) 
+        self.declare_parameter('goal_deadband_deg', 5)
+        # Blend between gap center (0) and deepest point (1); lower = wider arcs, more midpoint
+        self.declare_parameter('gap_target_bias', 0.35)
+        # Adaptive gap threshold: only rays >= this fraction of deepest range stay in the gap
+        self.declare_parameter('gap_depth_ratio', 0.55)
         
-        self.declare_parameter('max_speed', 4)
-        self.declare_parameter('min_speed', 0.8)
+        self.declare_parameter('max_speed', 6)
+        self.declare_parameter('min_speed', 2)
         
 
-        self.declare_parameter('kp', 0.7)
-        self.declare_parameter('ki', 0.0003)
-        self.declare_parameter('kd', 0.15)
-        self.declare_parameter('steer_smoothing', 0.97) 
+        self.declare_parameter('kp', 0.75)
+        self.declare_parameter('ki', 0.0000)
+        self.declare_parameter('kd', 0.2)
+        self.declare_parameter('steer_smoothing', 0.99) 
 
-        self.declare_parameter('wall_clearance', 0.4)      
-        self.declare_parameter('repulsion_gain', 2.5)      
-        self.declare_parameter('side_safety_dist', 0.13)   
+        self.declare_parameter('wall_clearance', 0.45)      
+        self.declare_parameter('repulsion_gain', 1.9)      
+        self.declare_parameter('side_safety_dist', 0.2)   
         self.declare_parameter('side_angle_window', 2.0)
         # Integral: time window (only sum errors over last N sec) and windup clamp
         self.declare_parameter('integral_window_sec', 2.0)
-        self.declare_parameter('integral_clamp', 0.5)
+        self.declare_parameter('integral_clamp', 0.1)
         # Brake when approach rate (closure rate) exceeds this (m/s); negative d(forward_clearance)/dt
-        self.declare_parameter('closure_rate_brake_threshold', 2.0)
+        self.declare_parameter('closure_rate_brake_threshold', 2)
         # Brake when time-to-collision (forward_clearance / |closure_rate|) is below this (seconds)
-        self.declare_parameter('ttc_brake_threshold', 0.5)
+        self.declare_parameter('ttc_brake_threshold', 0.9)
         # Brake if forward clearance (in emergency-brake cone) is below this (m), regardless of TTC
-        self.declare_parameter('min_clearance_brake', 0.25)
+        self.declare_parameter('min_clearance_brake', 0.15)
         # Half-angle (deg) for forward clearance / emergency brake: ±this around straight ahead (total = 2× this)
         self.declare_parameter('forward_clearance_half_deg', 5.0)
+        # Wall proximity slow-down: if repulsion is active AND the nearest side wall is below this
+        # distance (m), cap speed to wall_slow_speed regardless of min_speed
+        self.declare_parameter('wall_slow_dist', 0.3)
+        self.declare_parameter('wall_slow_speed', 0.5)
 
     def _apply_wall_smoothener(self, smoothed_ranges, angle_min, angle_inc, n, base_steer, lookahead):
         wall_clearance = self.get_parameter('wall_clearance').value
@@ -94,10 +103,10 @@ class ReactiveFollowGap(Node):
         max_rng = self.get_parameter('max_range').value
 
         # 1. Proactive Repulsion (only consider obstacles within lookahead distance)
-        left_start = max(0, int((np.radians(60) - angle_min) / angle_inc))
+        left_start = max(0, int((np.radians(50) - angle_min) / angle_inc))
         left_end = min(n, int((np.radians(120) - angle_min) / angle_inc))
         right_start = max(0, int((np.radians(-120) - angle_min) / angle_inc))
-        right_end = min(n, int((np.radians(-60) - angle_min) / angle_inc))
+        right_end = min(n, int((np.radians(-50) - angle_min) / angle_inc))
 
         left_window_repulse = smoothed_ranges[left_start:left_end]
         right_window_repulse = smoothed_ranges[right_start:right_end]
@@ -121,25 +130,25 @@ class ReactiveFollowGap(Node):
 
         combined_steer = base_steer + repulsion_steer
 
-        # 2. Hard Clamp Safety Check
-        left_idx = int((np.pi/2.0 - angle_min) / angle_inc)
-        right_idx = int((-np.pi/2.0 - angle_min) / angle_inc)
-        window_bins = int((side_window / 2.0) / angle_inc)
+        # 2. Hard Clamp Safety Check (disabled)
+        # left_idx = int((np.pi/2.0 - angle_min) / angle_inc)
+        # right_idx = int((-np.pi/2.0 - angle_min) / angle_inc)
+        # window_bins = int((side_window / 2.0) / angle_inc)
 
-        left_window_clamp = smoothed_ranges[max(0, left_idx - window_bins) : min(n, left_idx + window_bins)]
-        right_window_clamp = smoothed_ranges[max(0, right_idx - window_bins) : min(n, right_idx + window_bins)]
+        # left_window_clamp = smoothed_ranges[max(0, left_idx - window_bins) : min(n, left_idx + window_bins)]
+        # right_window_clamp = smoothed_ranges[max(0, right_idx - window_bins) : min(n, right_idx + window_bins)]
 
-        min_left_clamp = np.min(left_window_clamp) if len(left_window_clamp) > 0 else max_rng
-        min_right_clamp = np.min(right_window_clamp) if len(right_window_clamp) > 0 else max_rng
+        # min_left_clamp = np.min(left_window_clamp) if len(left_window_clamp) > 0 else max_rng
+        # min_right_clamp = np.min(right_window_clamp) if len(right_window_clamp) > 0 else max_rng
 
-        if combined_steer > 0.0 and min_left_clamp < side_dist:
-            combined_steer = 0.0
-            status = "LEFT PROT"
-        elif combined_steer < 0.0 and min_right_clamp < side_dist:
-            combined_steer = 0.0
-            status = "RIGHT PROT"
+        # if combined_steer > 0.0 and min_left_clamp < side_dist:
+        #     combined_steer = 0.0
+        #     status = "LEFT PROT"
+        # elif combined_steer < 0.0 and min_right_clamp < side_dist:
+        #     combined_steer = 0.0
+        #     status = "RIGHT PROT"
 
-        return combined_steer, repulsion_steer, status
+        return combined_steer, repulsion_steer, status, min_left_repulse, min_right_repulse
 
     def lidar_callback(self, data):
         t_start = self.get_clock().now().nanoseconds / 1e9
@@ -233,9 +242,22 @@ class ReactiveFollowGap(Node):
             # Deepest Point (Restricted strictly to the aim window)
             gap_aim_scan = scan[best_gap[0]:best_gap[1]] * aim_mask[best_gap[0]:best_gap[1]]
             deepest_idx = best_gap[0] + np.argmax(gap_aim_scan)
+            deepest_range = scan[deepest_idx]
+
+            raw_gap = best_gap  # save original gap for visualization
+
+            # Adaptive gap trim: only keep rays >= gap_depth_ratio * deepest_range
+            gap_depth_ratio = self.get_parameter('gap_depth_ratio').value
+            depth_threshold = deepest_range * gap_depth_ratio
+            gap_slice = scan[best_gap[0]:best_gap[1]]
+            qualifying = np.where(gap_slice >= depth_threshold)[0]
+            if len(qualifying) > 0:
+                best_gap = (best_gap[0] + qualifying[0], best_gap[0] + qualifying[-1] + 1)
+
             gap_center_idx = (best_gap[0] + best_gap[1]) // 2
         else:
             best_gap = (len(scan)//2, len(scan)//2 + 1)
+            raw_gap = best_gap
             deepest_idx = len(scan) // 2
             gap_center_idx = deepest_idx
 
@@ -262,10 +284,7 @@ class ReactiveFollowGap(Node):
         deep_y = deep_dist * np.sin(deep_angle)
 
         # -------------------------------------------------------------
-        # 6. CARTESIAN EMA GOAL FILTERING + RATE LIMITER
-        # EMA smooths the target, rate limiter caps how fast the goal
-        # angle can slew (deg/s) so the car follows a gentle arc
-        # instead of snapping into turns.
+        # 6. CARTESIAN EMA GOAL FILTERING
         # -------------------------------------------------------------
         if self.smoothed_goal_x is None:
             self.smoothed_goal_x = deep_x
@@ -282,18 +301,7 @@ class ReactiveFollowGap(Node):
             self.smoothed_goal_y *= scale
 
         ema_angle = float(np.arctan2(self.smoothed_goal_y, self.smoothed_goal_x))
-
-        # Rate-limit the goal angle (deg/s)
-        max_goal_rate = np.radians(self.get_parameter('max_goal_rate_deg_s').value)
-        angle_delta = ema_angle - self.prev_target_angle
-        # Wrap to [-pi, pi]
-        angle_delta = (angle_delta + np.pi) % (2 * np.pi) - np.pi
-        dt_goal = (self.get_clock().now().nanoseconds / 1e9) - self.prev_time
-        if dt_goal <= 0:
-            dt_goal = 0.01
-        max_change = max_goal_rate * dt_goal
-        angle_delta = np.clip(angle_delta, -max_change, max_change)
-        smoothed_target_angle = float(self.prev_target_angle + angle_delta)
+        smoothed_target_angle = ema_angle
 
         # Deadband: ignore tiny corrections
         if abs(smoothed_target_angle - self.prev_target_angle) > deadband:
@@ -334,7 +342,7 @@ class ReactiveFollowGap(Node):
         self.prev_time = current_time
 
         # 8. WALL SMOOTHENER (use adaptive lookahead so repulsion only considers obstacles within lookahead)
-        target_steer, repulsion_val, protection_status = self._apply_wall_smoothener(
+        target_steer, repulsion_val, protection_status, min_left_repulse, min_right_repulse = self._apply_wall_smoothener(
             smoothed_ranges, angle_min, angle_inc, n, pid_steer, adaptive_lookahead
         )
 
@@ -371,7 +379,15 @@ class ReactiveFollowGap(Node):
                 if ttc < ttc_threshold:
                     do_brake = True
         if do_brake:
-            speed = min_spd
+            speed = 0.0
+
+        # Wall proximity slow-down: cap speed independently of min_speed when hugging a wall
+        if not do_brake and protection_status in ("PUSHING LEFT", "PUSHING RIGHT", "SQUEEZED"):
+            wall_slow_dist = self.get_parameter('wall_slow_dist').value
+            wall_slow_speed = self.get_parameter('wall_slow_speed').value
+            nearest_side = min(min_left_repulse, min_right_repulse)
+            if nearest_side < wall_slow_dist:
+                speed = min(speed, wall_slow_speed)
 
         # TTC for logging (when closing)
         ttc_s = (forward_clearance / abs(closure_rate)) if (closure_rate is not None and closure_rate < 0 and abs(closure_rate) > 0.1 and forward_clearance > 0.01) else float('nan')
@@ -386,6 +402,14 @@ class ReactiveFollowGap(Node):
             f'steer_deg={np.degrees(steering_angle):.1f} error_deg={np.degrees(error):.2f} '
             f'integral={integral_error:.4f} repulsion={repulsion_val:.3f} protection={protection_status}'
         )
+
+        # # ------ DEADMAN OVERRIDE HERE ------
+        # if not self.deadman_engaged:
+        #     speed = 0.0
+        #     steering_angle = 0.0 # Optional: center wheels when stopped
+        #     self.integral_history.clear() # Prevent integral windup
+        #     self.get_logger().info('Deadman released! Car stopped.', throttle_duration_sec=2.0)
+        # # -----------------------------------
 
         # 10. Publish
         msg = AckermannDriveStamped()
@@ -406,7 +430,7 @@ class ReactiveFollowGap(Node):
         self.viz_scan_pub.publish(self._make_scan(data, full))
         
         self._publish_markers(
-            data, scan, lo, best_gap, 
+            data, scan, lo, best_gap, raw_gap,
             self.smoothed_goal_x, self.smoothed_goal_y, deep_x, deep_y, 
             steering_angle, repulsion_val, speed, protection_status
         )
@@ -427,7 +451,7 @@ class ReactiveFollowGap(Node):
         msg.ranges = ranges_full.tolist() 
         return msg
 
-    def _publish_markers(self, data, scan, lo, gap, sx, sy, dx, dy, steer, repulse, speed, protection_status):
+    def _publish_markers(self, data, scan, lo, gap, raw_gap, sx, sy, dx, dy, steer, repulse, speed, protection_status):
         a_min = data.angle_min
         a_inc = data.angle_increment
         stamp = self.get_clock().now().to_msg()
@@ -438,9 +462,27 @@ class ReactiveFollowGap(Node):
             return float(r * np.cos(a)), float(r * np.sin(a))
 
         gs, ge = gap
+        rgs, rge = raw_gap
         ma = MarkerArray()
 
-        # 1. ACTUAL CONTOUR GAP VISUALIZATION
+        # 0. RAW (pre-trim) GAP CONTOUR — dim yellow, shows what the algorithm originally found
+        m = Marker()
+        m.header.frame_id = fid
+        m.header.stamp = stamp
+        m.ns, m.id = 'raw_gap', 0
+        m.type = Marker.LINE_STRIP
+        m.action = Marker.ADD
+        m.scale.x = 0.04
+        m.color.r, m.color.g, m.color.b, m.color.a = 1.0, 1.0, 0.0, 0.35
+        raw_pts = []
+        for i in range(rgs, rge):
+            if scan[i] > 0.1:
+                px, py = to_xy(lo + i, float(scan[i]))
+                raw_pts.append(Point(x=px, y=py, z=-0.02))
+        m.points = raw_pts
+        ma.markers.append(m)
+
+        # 1. TRIMMED GAP CONTOUR — bright green, the actual gap used for targeting
         m = Marker()
         m.header.frame_id = fid
         m.header.stamp = stamp
@@ -548,6 +590,14 @@ class ReactiveFollowGap(Node):
         ma.markers.append(m)
 
         self.viz_gap_pub.publish(ma)
+
+    # # ── Joy Callback for Deadman Switch PS4 ─────────────────────────────────
+    # def joy_callback(self, msg):
+    #     """Updates deadman switch status based on PS4 controller input."""
+    #     button_idx = self.get_parameter('deadman_button').value
+    #     if len(msg.buttons) > button_idx:
+    #         # msg.buttons is 1 if pressed, 0 if released
+    #         self.deadman_engaged = bool(msg.buttons[button_idx])
 
 
 def main(args=None):
